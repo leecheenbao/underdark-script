@@ -762,8 +762,10 @@ def main():
 
     connect_device(DEVICE_ID)
 
-    success_count = 0
-    fail_count = 0
+    success_count    = 0
+    fail_count       = 0
+    consecutive_fail = 0          # 連續失敗計數
+    MAX_CONSECUTIVE  = 3          # 連續失敗上限，超過則停止腳本
 
     for i in range(NUM):
         log("=" * 50)
@@ -775,18 +777,27 @@ def main():
             ok = result[0] if isinstance(result, tuple) else bool(result)
             if ok:
                 success_count += 1
+                consecutive_fail = 0      # 成功一次就重置連續失敗計數
             else:
                 fail_count += 1
-                log(f"[警告] 第 {i+1} 次戰鬥回傳失敗，繼續下一輪")
+                consecutive_fail += 1
+                log(f"[警告] 第 {i+1} 次戰鬥回傳失敗（連續 {consecutive_fail}/{MAX_CONSECUTIVE}），繼續下一輪")
         except Exception as exc:
             fail_count += 1
-            log(f"[異常] 第 {i+1} 次戰鬥拋出例外: {exc}，繼續下一輪")
-            send_telegram(f"第 {i+1} 次戰鬥異常: {exc}")
-            time.sleep(2)  # 短暫等待，避免連續異常轟炸
+            consecutive_fail += 1
+            log(f"[異常] 第 {i+1} 次戰鬥拋出例外: {exc}（連續 {consecutive_fail}/{MAX_CONSECUTIVE}）")
+            time.sleep(2)
 
         log("=" * 50)
         log(f"第 {i+1}/{NUM} 次戰鬥完成")
         log("=" * 50)
+
+        # 連續失敗超過上限：發一則 TG 通知後停止，避免刷屏
+        if consecutive_fail >= MAX_CONSECUTIVE:
+            msg = f"連續失敗 {consecutive_fail} 次，腳本自動停止。請檢查設備與環境。（成功 {success_count} / 失敗 {fail_count} / 共 {i+1} 場）"
+            log(f"[停止] {msg}")
+            send_telegram(msg)
+            return
 
     summary = f"所有戰鬥完成：成功 {success_count} / 失敗 {fail_count} / 共 {NUM} 次"
     log("=" * 50)
