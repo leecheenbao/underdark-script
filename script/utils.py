@@ -9,6 +9,18 @@ import ssl
 import sys
 import time
 import os
+
+# Windows CP950/GBK 終端機無法印出 BMP 以外的 Unicode 字元（如 ≥ ≦ … 等）
+# 在模組載入時強制將 stdout/stderr 切換為 UTF-8，讓所有 log 不再崩潰
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONUTF8", "1")
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import gc
@@ -516,7 +528,7 @@ def wait_and_click_any(
 
         if heartbeat_sec > 0 and next_heartbeat is not None and time.time() >= next_heartbeat:
             log(
-                f"仍在等待 {name}… 本輪最高相似度: {best_sim:.4f}（{best_label}，閾值 {threshold}）"
+                f"仍在等待 {name}... 本輪最高相似度: {best_sim:.4f}（{best_label}，閾值 {threshold}）"
             )
             next_heartbeat = time.time() + heartbeat_sec
 
@@ -567,7 +579,7 @@ def wait_for_disappear(
             return True
 
         if heartbeat_sec > 0 and next_heartbeat is not None and time.time() >= next_heartbeat:
-            log(f"仍在等待 {name or img} 消失…（畫面上仍可匹配，相似度 {sim:.4f}）")
+            log(f"仍在等待 {name or img} 消失...（畫面上仍可匹配，相似度 {sim:.4f}）")
             next_heartbeat = time.time() + heartbeat_sec
 
         if timeout > 0 and time.time() - start >= timeout:

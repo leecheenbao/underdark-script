@@ -383,7 +383,7 @@ def recognize_digits(captcha_img):
             log(f"[驗證碼] 識別結果: {chosen}")
             return chosen
 
-        log(f"[驗證碼] 首次識別 0 組 4 位數，嘗試備用方法…（共 {len(variants)} 種變體）")
+        log(f"[驗證碼] 首次識別 0 組 4 位數，嘗試備用方法...（共 {len(variants)} 種變體）")
         for beta, r, text in last_raw[-8:]:
             norm = _normalize_ocr_digits(text)
             log(f"[驗證碼] OCR 原始 beta={beta} #{r}: {repr(text)} -> norm={repr(norm)}")
@@ -441,7 +441,7 @@ def _click_captcha_confirm():
 
 def solve_captcha(debug=False):
     """識別驗證碼並點擊數字（純 ADB）。CAPTCHA_REGION 為參考解析度下座標，必須 scale 到實際螢幕。"""
-    log("[驗證碼] 開始識別…")
+    log("[驗證碼] 開始識別...")
 
     screen_path = take_screenshot()
     img = cv2.imread(screen_path)
@@ -712,7 +712,7 @@ def run_fight(fight_no=None):
     wait_for_disappear_any(ADX2_TEMPLATES, timeout=0, interval=1, name="ADx2")
 
     # 6. 點擊確認戰鬥（模板 confirm_fight.png，勿誤用 adx2）
-    log("[步驟6] 等待確認戰鬥：將以模板匹配並點擊…")
+    log("[步驟6] 等待確認戰鬥：將以模板匹配並點擊...")
     wait_and_click(
         IMG['confirm_fight'],
         timeout=100,
@@ -723,7 +723,7 @@ def run_fight(fight_no=None):
     )
 
     # 7. 等待確認戰鬥按鈕／介面消失
-    log("[步驟7] 等待確認戰鬥消失：直到畫面上不再匹配 confirm_fight…")
+    log("[步驟7] 等待確認戰鬥消失：直到畫面上不再匹配 confirm_fight...")
     wait_for_disappear(
         IMG['confirm_fight'],
         timeout=100,
@@ -735,7 +735,7 @@ def run_fight(fight_no=None):
     pet_full_seen = pet_full_seen or _detect_pet_full_once("戰鬥結束")
 
     # # 8. 等待確認獎勵出現並點擊（持續心跳 log 方便排查）
-    # log("[步驟8] 等待確認獎勵：將以 confirm_rewards.png 匹配並點擊…")
+    # log("[步驟8] 等待確認獎勵：將以 confirm_rewards.png 匹配並點擊...")
     # wait_and_click(
     #     IMG['confirm_rewards'],
     #     timeout=0,
