@@ -1,6 +1,8 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
 
 echo [ADB] 連線 127.0.0.1:16384 ...
 adb connect 127.0.0.1:16384

@@ -1,6 +1,9 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+:: 強制 Python 以 UTF-8 輸出，避免 CP950 編碼錯誤
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
 
 echo =========================================
 echo  Under Dark 控制台 - 環境檢查

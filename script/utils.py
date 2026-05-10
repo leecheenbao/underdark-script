@@ -6,6 +6,7 @@ UnderGuild 自動化工具類
 import cv2
 import json
 import ssl
+import sys
 import time
 import os
 from urllib.error import HTTPError, URLError
@@ -175,7 +176,12 @@ def log(msg, telegram=None):
     """
     timestamp = datetime.now().strftime("%H:%M:%S")
     line = f"[{timestamp}] {msg}"
-    print(line)
+    # Windows CP950/GBK 終端機遇到 BMP 以外字元會拋出 UnicodeEncodeError，加上 errors='replace' 避免崩潰
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        print(line.encode(sys.stdout.encoding or "utf-8", errors="replace")
+                  .decode(sys.stdout.encoding or "utf-8", errors="replace"))
     if telegram is False:
         return
     if telegram is True:
@@ -443,7 +449,7 @@ def wait_and_click(
 
         if heartbeat_sec > 0 and next_heartbeat is not None and time.time() >= next_heartbeat:
             log(
-                f"仍在等待 {name or img}… 目前最高相似度: {sim:.4f}（閾值 {threshold}，需≥閾值才點擊）"
+                f"仍在等待 {name or img}... 目前最高相似度: {sim:.4f}（閾值 {threshold}，需>=閾值才點擊）"
             )
             next_heartbeat = time.time() + heartbeat_sec
 

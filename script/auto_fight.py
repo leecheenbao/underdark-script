@@ -417,7 +417,7 @@ def _click_confirm_in_roi_once(threshold):
     if not found or rx is None or ry is None:
         return False
     tx, ty = int(rx), int(ry) + y0
-    click_fixed(tx, ty, delay=0.35, name=f"驗證碼確認(相似度 {sim:.2f}, y≥{y0})")
+    click_fixed(tx, ty, delay=0.35, name=f"驗證碼確認(相似度 {sim:.2f}, y>={y0})")
     return True
 
 
