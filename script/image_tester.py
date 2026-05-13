@@ -37,6 +37,18 @@ PIC_DIR      = os.path.join(SCRIPT_DIR, "../pic")
 CACHE_DIR    = os.path.join(PIC_DIR, "cache")
 SETTINGS_PATH = os.path.join(SCRIPT_DIR, "settings.json")
 AUTO_FIGHT_PY = os.path.join(SCRIPT_DIR, "auto_fight.py")
+RUN_AUTO_FIGHT_BAT = os.path.join(SCRIPT_DIR, "run_auto_fight.bat")
+RUN_AUTO_FIGHT_WEB_BAT = os.path.join(SCRIPT_DIR, "run_auto_fight_web.bat")
+SL_RUN_CANDIDATES = [
+    os.path.join(SCRIPT_DIR, "run_sl_web.bat"),
+    os.path.join(SCRIPT_DIR, "run_sl.bat"),
+    os.path.join(SCRIPT_DIR, "run_auto_fight_sl_web.bat"),
+    os.path.join(SCRIPT_DIR, "run_auto_fight_sl.bat"),
+]
+SL_PY_CANDIDATES = [
+    os.path.join(SCRIPT_DIR, "auto_fight_sl.py"),
+    os.path.join(SCRIPT_DIR, "sl_flow.py"),
+]
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 # 允許上傳的子目錄（空字串=pic/ 根目錄）
@@ -84,21 +96,45 @@ def _read_stream(stream):
     _enqueue_log("[腳本] 程序已結束")
 
 
-def start_script(num: int | None = None, device_id: str | None = None):
-    """啟動 auto_fight.py（已有程序在跑則不重複啟動）"""
+def start_script(
+    num: int | None = None,
+    device_id: str | None = None,
+    device_id_1: str | None = None,
+    device_id_2: str | None = None,
+):
+    """啟動控制台專用 bat（已有程序在跑則不重複啟動）"""
     global _proc
     with _proc_lock:
         if _proc and _proc.poll() is None:
             return False, "腳本已在執行中"
 
         # 寫入臨時參數到 settings.json（可選）
-        if num is not None or device_id is not None:
-            _patch_settings(num=num, device_id=device_id)
+        if num is not None or device_id is not None or device_id_1 is not None or device_id_2 is not None:
+            _patch_settings(
+                num=num,
+                device_id=device_id,
+                device_id_1=device_id_1,
+                device_id_2=device_id_2,
+            )
+
+        run_bat = RUN_AUTO_FIGHT_WEB_BAT if os.path.exists(RUN_AUTO_FIGHT_WEB_BAT) else RUN_AUTO_FIGHT_BAT
+        if not os.path.exists(run_bat):
+            return False, f"找不到啟動檔：{run_bat}"
+
+        # 一般「啟動腳本」固定只跑第一組設備；雙設備請使用 SL 流程按鈕
+        cur = _read_current_devices()
+        run_device = (
+            str(device_id_1 or "").strip()
+            or str(device_id or "").strip()
+            or str((cur or {}).get("device_id_1") or "").strip()
+        )
+        if not run_device:
+            return False, "未設定第一組設備 ID（請先到設定頁填入 ADB 設備 ID #1）"
 
         env = os.environ.copy()
         try:
             _proc = subprocess.Popen(
-                [sys.executable, AUTO_FIGHT_PY],
+                ["cmd.exe", "/c", run_bat, "--device-id", run_device, "--worker-name", "模擬器1"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -112,17 +148,89 @@ def start_script(num: int | None = None, device_id: str | None = None):
             return False, str(e)
 
         threading.Thread(target=_read_stream, args=(_proc.stdout,), daemon=True).start()
-        _enqueue_log(f"[系統] 腳本已啟動 (PID {_proc.pid})")
-        return True, f"腳本已啟動 (PID {_proc.pid})"
+        _enqueue_log(f"[系統] 腳本已啟動（第一組設備: {run_device}, PID {_proc.pid}）")
+        return True, f"腳本已啟動（第一組設備: {run_device}, PID {_proc.pid}）"
+
+
+def _resolve_sl_launch_command():
+    """解析 SL 流程啟動命令（優先 bat，其次 python 腳本）。"""
+    for bat in SL_RUN_CANDIDATES:
+        if os.path.exists(bat):
+            return ["cmd.exe", "/c", bat], f"BAT: {os.path.basename(bat)}"
+    for py_file in SL_PY_CANDIDATES:
+        if os.path.exists(py_file):
+            return [sys.executable, "-u", py_file], f"PY: {os.path.basename(py_file)}"
+    return None, ""
+
+
+def start_sl_script(
+    num: int | None = None,
+    device_id_1: str | None = None,
+    device_id_2: str | None = None,
+):
+    """啟動 SL 流程腳本（已有程序在跑則不重複啟動）。"""
+    global _proc
+    with _proc_lock:
+        if _proc and _proc.poll() is None:
+            return False, "已有腳本在執行中，請先停止"
+
+        # 延用同一組設定入口，讓 SL 腳本可共用兩台設備設定
+        if num is not None or device_id_1 is not None or device_id_2 is not None:
+            _patch_settings(
+                num=num,
+                device_id_1=device_id_1,
+                device_id_2=device_id_2,
+            )
+
+        cmd, picked = _resolve_sl_launch_command()
+        if not cmd:
+            return False, (
+                "找不到 SL 流程啟動檔。請新增其一："
+                "run_sl_web.bat / run_sl.bat / run_auto_fight_sl_web.bat / run_auto_fight_sl.bat "
+                "或 auto_fight_sl.py / sl_flow.py"
+            )
+
+        env = os.environ.copy()
+        try:
+            _proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                cwd=SCRIPT_DIR,
+                env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+        except Exception as e:
+            return False, str(e)
+
+        threading.Thread(target=_read_stream, args=(_proc.stdout,), daemon=True).start()
+        _enqueue_log(f"[系統] SL 流程已啟動 ({picked}, PID {_proc.pid})")
+        return True, f"SL 流程已啟動 ({picked}, PID {_proc.pid})"
 
 
 def stop_script():
-    """停止 auto_fight.py"""
+    """停止 run_auto_fight.bat（含其子程序）"""
     global _proc
     with _proc_lock:
         if _proc is None or _proc.poll() is not None:
             return False, "腳本未在執行中"
-        _proc.terminate()
+
+        # Windows: bat 通常會帶出子程序（py/adb），先嘗試整棵程序樹停止
+        if sys.platform == "win32":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(_proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except Exception:
+                pass
+        else:
+            _proc.terminate()
+
         try:
             _proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -138,16 +246,35 @@ def script_status():
         return "running" if _proc.poll() is None else "idle"
 
 
-def _patch_settings(num: int | None, device_id: str | None):
-    """將 num 寫入 auto_fight.py 的 NUM 行（非 settings.json），device_id 寫入 settings.json"""
+def _patch_settings(
+    num: int | None,
+    device_id: str | None = None,
+    device_id_1: str | None = None,
+    device_id_2: str | None = None,
+):
+    """將 num 寫入 auto_fight.py；設備 ID 寫入 settings.json（支援 1/2 號模擬器）。"""
     if num is not None:
         _patch_auto_fight_num(num)
-    if device_id is not None and os.path.exists(SETTINGS_PATH):
+    if (device_id is not None or device_id_1 is not None or device_id_2 is not None) and os.path.exists(SETTINGS_PATH):
         try:
             with open(SETTINGS_PATH, encoding="utf-8-sig") as f:
                 cfg = json.load(f)
-            default_key = cfg.get("default_emulator", "1")
-            cfg["emulators"][default_key]["id"] = device_id
+            emulators = cfg.setdefault("emulators", {})
+            emulators.setdefault("1", {"id": "", "name": "模擬器1"})
+            emulators.setdefault("2", {"id": "", "name": "模擬器2"})
+
+            # 相容舊前端：僅傳 device_id 時，仍寫入 default_emulator 指向的那一組
+            if device_id is not None:
+                default_key = str(cfg.get("default_emulator", "1"))
+                emulators.setdefault(default_key, {"id": "", "name": f"模擬器{default_key}"})
+                emulators[default_key]["id"] = str(device_id).strip()
+            if device_id_1 is not None:
+                emulators["1"]["id"] = str(device_id_1).strip()
+            if device_id_2 is not None:
+                emulators["2"]["id"] = str(device_id_2).strip()
+
+            # 預設始終指向 1 號，主腳本會自動取前兩組有效設備並行執行
+            cfg["default_emulator"] = "1"
             with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except Exception:
@@ -184,15 +311,17 @@ def _read_current_num():
     return 500
 
 
-def _read_current_device():
-    """從 settings.json 讀取預設設備 ID"""
+def _read_current_devices():
+    """從 settings.json 讀取 1/2 號設備 ID"""
     try:
         with open(SETTINGS_PATH, encoding="utf-8-sig") as f:
             cfg = json.load(f)
-        default_key = cfg.get("default_emulator", "1")
-        return cfg["emulators"][default_key]["id"]
+        emulators = cfg.get("emulators", {})
+        dev1 = str((emulators.get("1") or {}).get("id") or "").strip()
+        dev2 = str((emulators.get("2") or {}).get("id") or "").strip()
+        return {"device_id_1": dev1, "device_id_2": dev2}
     except Exception:
-        return ""
+        return {"device_id_1": "", "device_id_2": ""}
 
 
 # ════════════════════════════════════════════════════════════
@@ -444,7 +573,28 @@ def api_script_start():
     body      = request.json or {}
     num       = int(body["num"]) if "num" in body else None
     device_id = body.get("device_id") or None
-    ok, msg   = start_script(num=num, device_id=device_id)
+    device_id_1 = body.get("device_id_1")
+    device_id_2 = body.get("device_id_2")
+    ok, msg   = start_script(
+        num=num,
+        device_id=device_id,
+        device_id_1=device_id_1,
+        device_id_2=device_id_2,
+    )
+    return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/api/script/start-sl", methods=["POST"])
+def api_script_start_sl():
+    body      = request.json or {}
+    num       = int(body["num"]) if "num" in body else None
+    device_id_1 = body.get("device_id_1")
+    device_id_2 = body.get("device_id_2")
+    ok, msg   = start_sl_script(
+        num=num,
+        device_id_1=device_id_1,
+        device_id_2=device_id_2,
+    )
     return jsonify({"ok": ok, "message": msg})
 
 
@@ -486,9 +636,12 @@ def api_logs_clear():
 # ── 設定讀寫 ──────────────────────────────────────────────────
 @app.route("/api/settings")
 def api_settings_get():
+    devs = _read_current_devices()
     return jsonify({
         "num":       _read_current_num(),
-        "device_id": _read_current_device(),
+        "device_id": devs.get("device_id_1", ""),  # 相容舊前端
+        "device_id_1": devs.get("device_id_1", ""),
+        "device_id_2": devs.get("device_id_2", ""),
     })
 
 
@@ -497,7 +650,14 @@ def api_settings_set():
     body      = request.json or {}
     num       = int(body["num"]) if "num" in body else None
     device_id = body.get("device_id") or None
-    _patch_settings(num=num, device_id=device_id)
+    device_id_1 = body.get("device_id_1")
+    device_id_2 = body.get("device_id_2")
+    _patch_settings(
+        num=num,
+        device_id=device_id,
+        device_id_1=device_id_1,
+        device_id_2=device_id_2,
+    )
     return jsonify({"ok": True})
 
 
@@ -628,6 +788,7 @@ header h1{font-size:1.05rem;color:var(--accent);white-space:nowrap}
 .btn{padding:7px 14px;border:none;border-radius:6px;cursor:pointer;font-size:.83rem;font-weight:600;transition:.15s}
 .btn-accent{background:var(--accent);color:#fff}.btn-accent:hover{background:#c73652}
 .btn-green{background:var(--green);color:#fff}.btn-green:hover{background:#1e8449}
+.btn-purple{background:#8e44ad;color:#fff}.btn-purple:hover{background:#7d3c98}
 .btn-orange{background:var(--orange);color:#fff}.btn-orange:hover{background:#ca6f1e}
 .btn-gray{background:#2a3f6a;color:var(--text)}.btn-gray:hover{background:#3a5080}
 .btn-danger{background:#c0392b;color:#fff}.btn-danger:hover{background:#a93226}
@@ -653,6 +814,16 @@ header h1{font-size:1.05rem;color:var(--accent);white-space:nowrap}
 /* ── 拖放上傳區 ── */
 .dropzone{border:2px dashed var(--border);border-radius:8px;padding:22px;text-align:center;cursor:pointer;color:var(--muted);font-size:.85rem;transition:.2s}
 .dropzone:hover,.dropzone.drag-over{border-color:var(--accent);color:var(--accent)}
+/* ── 螢幕框選截圖 ── */
+.capture-modal{position:fixed;inset:0;background:rgba(0,0,0,.78);display:none;align-items:center;justify-content:center;z-index:9999}
+.capture-modal.show{display:flex}
+.capture-panel{width:min(92vw,1200px);max-height:92vh;background:#101b34;border:1px solid var(--border);border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:10px}
+.capture-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.capture-hint{font-size:.8rem;color:var(--muted)}
+#captureCanvas{max-width:100%;max-height:72vh;display:block;border:1px solid var(--border);border-radius:6px;background:#060c1a;cursor:crosshair}
+.capture-preview{display:flex;align-items:center;gap:10px;min-height:56px}
+.capture-preview img{max-height:52px;max-width:240px;border:1px solid var(--border);border-radius:4px;background:#060c1a}
+.capture-preview .empty{font-size:.78rem;color:var(--muted)}
 /* ── Log 區 ── */
 #logBox{background:#060c1a;border:1px solid var(--border);border-radius:6px;padding:10px;font-size:.76rem;font-family:monospace;height:calc(100vh - 180px);overflow-y:auto;color:#7ecf7e;line-height:1.6;white-space:pre-wrap;word-break:break-all}
 /* ── OCR 測試 ── */
@@ -679,6 +850,7 @@ header h1{font-size:1.05rem;color:var(--accent);white-space:nowrap}
   <span id="statusText">讀取中…</span>
   <div style="flex:1"></div>
   <button class="btn btn-green" id="btnStart" onclick="startScript()">▶ 啟動腳本</button>
+  <button class="btn btn-purple" id="btnStartSL" onclick="startSlScript()">⟳ 啟動SL流程</button>
   <button class="btn btn-danger" id="btnStop" onclick="stopScript()">■ 停止腳本</button>
 </header>
 
@@ -718,6 +890,7 @@ header h1{font-size:1.05rem;color:var(--accent);white-space:nowrap}
             <option value="blacklist">pic/blacklist/</option>
           </select>
         </div>
+        <button class="btn btn-orange" type="button" style="margin-top:18px" onclick="captureTemplateFromScreen()">🖼 框選螢幕截圖</button>
       </div>
       <div class="dropzone" id="uploadZone"
            onclick="document.getElementById('uploadInput').click()"
@@ -819,9 +992,13 @@ header h1{font-size:1.05rem;color:var(--accent);white-space:nowrap}
         <label>執行場次 (NUM)</label>
         <input id="cfgNum" type="number" min="1" value="500" style="width:140px">
       </div>
+      <div class="field" style="margin-bottom:12px">
+        <label>ADB 設備 ID #1（如 127.0.0.1:16384）</label>
+        <input id="cfgDevice1" type="text" style="width:320px" placeholder="127.0.0.1:16384">
+      </div>
       <div class="field" style="margin-bottom:16px">
-        <label>ADB 設備 ID（如 127.0.0.1:16384）</label>
-        <input id="cfgDevice" type="text" style="width:280px" placeholder="127.0.0.1:16384">
+        <label>ADB 設備 ID #2（如 127.0.0.1:16416）</label>
+        <input id="cfgDevice2" type="text" style="width:320px" placeholder="127.0.0.1:16416">
       </div>
       <button class="btn btn-green" onclick="saveSettings()">💾 儲存設定</button>
       <span id="settingsSaved" style="font-size:.8rem;color:var(--green);margin-left:10px;display:none">✅ 已儲存</span>
@@ -830,11 +1007,28 @@ header h1{font-size:1.05rem;color:var(--accent);white-space:nowrap}
       <div class="card-title">說明</div>
       <ul style="font-size:.8rem;color:var(--muted);line-height:1.9;padding-left:16px">
         <li>「執行場次」會即時修改 <code>auto_fight.py</code> 的 <code>NUM</code> 值</li>
-        <li>「設備 ID」會寫入 <code>settings.json</code> 的 default 模擬器 id</li>
+        <li>可同時設定兩組設備 ID，腳本啟動時會自動並行執行兩台模擬器</li>
         <li>設定儲存後，下次啟動腳本時才生效</li>
         <li>模板圖請存為 PNG；上傳後不需重啟伺服器</li>
       </ul>
     </div>
+  </div>
+</div>
+
+<!-- ═══ 螢幕框選截圖 Modal ═══ -->
+<div id="captureModal" class="capture-modal">
+  <div class="capture-panel">
+    <div class="capture-toolbar">
+      <span class="capture-hint">請在畫面上拖曳框選要存成模板的範圍</span>
+      <div style="flex:1"></div>
+      <button class="btn btn-gray" type="button" onclick="resetCaptureSelection()">重設框選</button>
+      <button class="btn btn-danger" type="button" onclick="closeCaptureModal()">取消</button>
+      <button class="btn btn-green" type="button" id="btnSaveCapture" onclick="saveCapturedTemplate()" disabled>儲存截圖</button>
+    </div>
+    <div class="capture-preview" id="capturePreviewWrap">
+      <span class="empty">尚未框選範圍</span>
+    </div>
+    <canvas id="captureCanvas"></canvas>
   </div>
 </div>
 
@@ -853,14 +1047,39 @@ function switchTab(id) {
 
 // ════════════ 狀態輪詢 ════════════
 let scriptRunning = false;
+function appendLocalLog(msg, color = '#e67e22') {
+  const box = document.getElementById('logBox');
+  if (!box) return;
+  const line = document.createElement('div');
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2, '0');
+  const mm = String(now.getMinutes()).padStart(2, '0');
+  const ss = String(now.getSeconds()).padStart(2, '0');
+  line.textContent = `[${hh}:${mm}:${ss}] [前端] ${msg}`;
+  line.style.color = color;
+  box.appendChild(line);
+  if (document.getElementById('autoScroll')?.checked) {
+    box.scrollTop = box.scrollHeight;
+  }
+}
+
 async function pollStatus() {
   try {
     const d = await fetch('/api/script/status').then(r=>r.json());
     scriptRunning = d.status === 'running';
-  } catch(e) { scriptRunning = false; }
+  } catch(e) {
+    scriptRunning = false;
+    document.getElementById('statusDot').className = 'status-dot';
+    document.getElementById('statusText').textContent = '控制台連線失敗';
+    document.getElementById('btnStart').disabled = false;
+    document.getElementById('btnStartSL').disabled = false;
+    document.getElementById('btnStop').disabled  = true;
+    return;
+  }
   document.getElementById('statusDot').className = 'status-dot' + (scriptRunning ? ' running' : '');
   document.getElementById('statusText').textContent = scriptRunning ? '腳本執行中' : '閒置';
   document.getElementById('btnStart').disabled = scriptRunning;
+  document.getElementById('btnStartSL').disabled = scriptRunning;
   document.getElementById('btnStop').disabled  = !scriptRunning;
 }
 setInterval(pollStatus, 2000);
@@ -869,21 +1088,67 @@ pollStatus();
 // ════════════ 腳本控制 ════════════
 async function startScript() {
   const num      = parseInt(document.getElementById('cfgNum')?.value) || undefined;
-  const deviceId = document.getElementById('cfgDevice')?.value.trim() || undefined;
-  const resp = await fetch('/api/script/start', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({num, device_id: deviceId}),
-  });
-  const d = await resp.json();
-  if (!d.ok) alert('啟動失敗：' + d.message);
-  pollStatus();
+  const deviceId1 = document.getElementById('cfgDevice1')?.value.trim() || undefined;
+  try {
+    const resp = await fetch('/api/script/start', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({num, device_id_1: deviceId1}),
+    });
+    const d = await resp.json();
+    if (!d.ok) {
+      appendLocalLog(`啟動失敗：${d.message}`, '#e74c3c');
+      alert('啟動失敗：' + d.message);
+    } else {
+      appendLocalLog(d.message || '已送出啟動請求', '#2ecc71');
+    }
+  } catch (e) {
+    const msg = `無法連線到控制台後端（${e?.message || e}）`;
+    appendLocalLog(msg, '#e74c3c');
+    alert(msg);
+  }
+  await pollStatus();
+}
+
+async function startSlScript() {
+  const num      = parseInt(document.getElementById('cfgNum')?.value) || undefined;
+  const deviceId1 = document.getElementById('cfgDevice1')?.value.trim() || undefined;
+  const deviceId2 = document.getElementById('cfgDevice2')?.value.trim() || undefined;
+  try {
+    const resp = await fetch('/api/script/start-sl', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({num, device_id_1: deviceId1, device_id_2: deviceId2}),
+    });
+    const d = await resp.json();
+    if (!d.ok) {
+      appendLocalLog(`SL 啟動失敗：${d.message}`, '#e74c3c');
+      alert('SL 啟動失敗：' + d.message);
+    } else {
+      appendLocalLog(d.message || '已送出 SL 啟動請求', '#9b59b6');
+    }
+  } catch (e) {
+    const msg = `無法連線到控制台後端（${e?.message || e}）`;
+    appendLocalLog(msg, '#e74c3c');
+    alert(msg);
+  }
+  await pollStatus();
 }
 
 async function stopScript() {
-  const resp = await fetch('/api/script/stop', {method:'POST'});
-  const d = await resp.json();
-  if (!d.ok) alert('停止失敗：' + d.message);
-  pollStatus();
+  try {
+    const resp = await fetch('/api/script/stop', {method:'POST'});
+    const d = await resp.json();
+    if (!d.ok) {
+      appendLocalLog(`停止失敗：${d.message}`, '#e74c3c');
+      alert('停止失敗：' + d.message);
+    } else {
+      appendLocalLog(d.message || '已送出停止請求', '#f39c12');
+    }
+  } catch (e) {
+    const msg = `無法連線到控制台後端（${e?.message || e}）`;
+    appendLocalLog(msg, '#e74c3c');
+    alert(msg);
+  }
+  await pollStatus();
 }
 
 // ════════════ SSE Log ════════════
@@ -914,6 +1179,15 @@ async function clearLogs() {
 // ════════════ 模板管理 ════════════
 let allTemplates = [];
 let filterDir = '';
+let captureState = {
+  sourceCanvas: null,
+  viewCanvas: null,
+  viewCtx: null,
+  scale: 1,
+  selection: null,
+  dragging: false,
+  dragStart: null,
+};
 
 async function loadTemplates() {
   allTemplates = await fetch('/api/templates').then(r=>r.json());
@@ -976,6 +1250,229 @@ async function handleUploadFiles(files) {
   if (d.saved.length)  el.innerHTML = `✅ 已上傳：${d.saved.join(', ')}`;
   if (d.errors.length) el.innerHTML += `<br>❌ ${d.errors.join('; ')}`;
   loadTemplates();
+}
+
+// ════════════ 框選螢幕截圖上傳 ════════════
+async function captureTemplateFromScreen() {
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    alert('此瀏覽器不支援螢幕擷取，請改用 Chrome/Edge。');
+    return;
+  }
+  try {
+    // 先讓使用者選擇要分享的畫面，再擷取一張靜態影像
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    const video = document.createElement('video');
+    video.srcObject = stream;
+    video.playsInline = true;
+    video.muted = true;
+    await video.play();
+    await new Promise(resolve => {
+      if (video.videoWidth > 0) resolve();
+      else video.onloadedmetadata = resolve;
+    });
+
+    const src = document.createElement('canvas');
+    src.width = video.videoWidth;
+    src.height = video.videoHeight;
+    src.getContext('2d').drawImage(video, 0, 0, src.width, src.height);
+
+    stream.getTracks().forEach(t => t.stop());
+    openCaptureModal(src);
+  } catch (e) {
+    alert(`螢幕擷取失敗：${e?.message || e}`);
+  }
+}
+
+function openCaptureModal(sourceCanvas) {
+  const modal = document.getElementById('captureModal');
+  const canvas = document.getElementById('captureCanvas');
+  const ctx = canvas.getContext('2d');
+  captureState.sourceCanvas = sourceCanvas;
+  captureState.viewCanvas = canvas;
+  captureState.viewCtx = ctx;
+  captureState.selection = null;
+  captureState.dragging = false;
+  captureState.dragStart = null;
+
+  const maxW = Math.min(window.innerWidth * 0.9, 1150);
+  const maxH = Math.min(window.innerHeight * 0.72, 760);
+  const scale = Math.min(maxW / sourceCanvas.width, maxH / sourceCanvas.height, 1);
+  captureState.scale = scale;
+  canvas.width = Math.max(1, Math.round(sourceCanvas.width * scale));
+  canvas.height = Math.max(1, Math.round(sourceCanvas.height * scale));
+
+  canvas.onmousedown = onCaptureMouseDown;
+  canvas.onmousemove = onCaptureMouseMove;
+  window.onmouseup = onCaptureMouseUp;
+  document.getElementById('btnSaveCapture').disabled = true;
+  document.getElementById('capturePreviewWrap').innerHTML = '<span class="empty">尚未框選範圍</span>';
+  redrawCaptureCanvas();
+  modal.classList.add('show');
+}
+
+function closeCaptureModal() {
+  document.getElementById('captureModal').classList.remove('show');
+  const canvas = document.getElementById('captureCanvas');
+  canvas.onmousedown = null;
+  canvas.onmousemove = null;
+  window.onmouseup = null;
+}
+
+function resetCaptureSelection() {
+  captureState.selection = null;
+  captureState.dragStart = null;
+  captureState.dragging = false;
+  document.getElementById('btnSaveCapture').disabled = true;
+  document.getElementById('capturePreviewWrap').innerHTML = '<span class="empty">尚未框選範圍</span>';
+  redrawCaptureCanvas();
+}
+
+function canvasPoint(ev) {
+  const rect = captureState.viewCanvas.getBoundingClientRect();
+  const x = Math.max(0, Math.min(captureState.viewCanvas.width, ev.clientX - rect.left));
+  const y = Math.max(0, Math.min(captureState.viewCanvas.height, ev.clientY - rect.top));
+  return { x, y };
+}
+
+function onCaptureMouseDown(ev) {
+  const p = canvasPoint(ev);
+  captureState.dragging = true;
+  captureState.dragStart = p;
+  captureState.selection = { x1: p.x, y1: p.y, x2: p.x, y2: p.y };
+  redrawCaptureCanvas();
+}
+
+function onCaptureMouseMove(ev) {
+  if (!captureState.dragging || !captureState.dragStart) return;
+  const p = canvasPoint(ev);
+  captureState.selection = {
+    x1: Math.min(captureState.dragStart.x, p.x),
+    y1: Math.min(captureState.dragStart.y, p.y),
+    x2: Math.max(captureState.dragStart.x, p.x),
+    y2: Math.max(captureState.dragStart.y, p.y),
+  };
+  redrawCaptureCanvas();
+}
+
+function onCaptureMouseUp() {
+  if (!captureState.dragging) return;
+  captureState.dragging = false;
+  const s = captureState.selection;
+  const valid = s && (s.x2 - s.x1) >= 6 && (s.y2 - s.y1) >= 6;
+  document.getElementById('btnSaveCapture').disabled = !valid;
+  renderCapturePreview(valid);
+}
+
+function redrawCaptureCanvas() {
+  const { sourceCanvas, viewCanvas, viewCtx, selection } = captureState;
+  if (!sourceCanvas || !viewCanvas || !viewCtx) return;
+  viewCtx.clearRect(0, 0, viewCanvas.width, viewCanvas.height);
+  viewCtx.drawImage(sourceCanvas, 0, 0, viewCanvas.width, viewCanvas.height);
+  if (!selection) return;
+  viewCtx.save();
+  viewCtx.fillStyle = 'rgba(0,0,0,0.35)';
+  viewCtx.fillRect(0, 0, viewCanvas.width, viewCanvas.height);
+  const w = selection.x2 - selection.x1;
+  const h = selection.y2 - selection.y1;
+  viewCtx.clearRect(selection.x1, selection.y1, w, h);
+  viewCtx.strokeStyle = '#e94560';
+  viewCtx.lineWidth = 2;
+  viewCtx.strokeRect(selection.x1 + 0.5, selection.y1 + 0.5, w, h);
+  viewCtx.restore();
+}
+
+function getSelectionCropCanvas() {
+  const s = captureState.selection;
+  if (!s || !captureState.sourceCanvas) return null;
+  const scale = captureState.scale || 1;
+  const src = captureState.sourceCanvas;
+  const x = Math.max(0, Math.round(s.x1 / scale));
+  const y = Math.max(0, Math.round(s.y1 / scale));
+  const w = Math.max(1, Math.round((s.x2 - s.x1) / scale));
+  const h = Math.max(1, Math.round((s.y2 - s.y1) / scale));
+  const crop = document.createElement('canvas');
+  crop.width = w;
+  crop.height = h;
+  crop.getContext('2d').drawImage(src, x, y, w, h, 0, 0, w, h);
+  return crop;
+}
+
+function renderCapturePreview(valid = true) {
+  const wrap = document.getElementById('capturePreviewWrap');
+  if (!valid) {
+    wrap.innerHTML = '<span class="empty">框選太小，請重新選擇</span>';
+    return;
+  }
+  const crop = getSelectionCropCanvas();
+  if (!crop) {
+    wrap.innerHTML = '<span class="empty">尚未框選範圍</span>';
+    return;
+  }
+  wrap.innerHTML = `
+    <span style="font-size:.78rem;color:var(--muted)">裁切預覽：</span>
+    <img src="${crop.toDataURL('image/png')}" alt="裁切預覽">
+    <span style="font-size:.75rem;color:var(--muted)">${crop.width} × ${crop.height}</span>
+  `;
+}
+
+function sanitizeTemplateFileName(rawName) {
+  const base = (rawName || '').trim().replace(/\.png$/i, '');
+  if (!base) return '';
+  // 避免路徑字元與特殊字元
+  return base.replace(/[\\/:*?"<>|]/g, '_');
+}
+
+async function saveCapturedTemplate() {
+  const s = captureState.selection;
+  if (!s) return;
+  const raw = prompt('請輸入模板檔名（不用加 .png）', 'new_template');
+  if (raw === null) return;
+  const safeName = sanitizeTemplateFileName(raw);
+  if (!safeName) {
+    alert('檔名不可為空。');
+    return;
+  }
+
+  const crop = getSelectionCropCanvas();
+  if (!crop) {
+    alert('尚未選擇有效範圍。');
+    return;
+  }
+
+  const blob = await new Promise(resolve => crop.toBlob(resolve, 'image/png'));
+  if (!blob) {
+    alert('截圖轉檔失敗，請重試。');
+    return;
+  }
+
+  const subdir = document.getElementById('uploadSubdir').value;
+  const fileName = `${safeName}.png`;
+  try {
+    const list = await fetch('/api/templates').then(r => r.json());
+    const duplicated = (list || []).some(t => t.subdir === subdir && (t.name || '').toLowerCase() === fileName.toLowerCase());
+    if (duplicated) {
+      const folderLabel = subdir ? `pic/${subdir}` : 'pic';
+      const shouldOverwrite = confirm(`${folderLabel} 已存在 ${fileName}，是否覆蓋？`);
+      if (!shouldOverwrite) return;
+    }
+  } catch (e) {
+    // 清單讀取失敗時，仍允許使用者繼續上傳
+  }
+
+  const fd = new FormData();
+  fd.append('subdir', subdir);
+  fd.append('images', blob, fileName);
+
+  const resp = await fetch('/api/upload-template', { method: 'POST', body: fd });
+  const d = await resp.json();
+  const el = document.getElementById('uploadResult');
+  if (d.saved?.length) {
+    el.innerHTML = `✅ 已上傳：${d.saved.join(', ')}`;
+    closeCaptureModal();
+    loadTemplates();
+    return;
+  }
+  el.innerHTML = `❌ 上傳失敗：${(d.errors || [d.error || '未知錯誤']).join('; ')}`;
 }
 
 // ════════════ OCR 測試 ════════════
@@ -1066,14 +1563,16 @@ async function runMatch() {
 async function loadSettings() {
   const d = await fetch('/api/settings').then(r=>r.json());
   document.getElementById('cfgNum').value    = d.num;
-  document.getElementById('cfgDevice').value = d.device_id;
+  document.getElementById('cfgDevice1').value = d.device_id_1 || d.device_id || '';
+  document.getElementById('cfgDevice2').value = d.device_id_2 || '';
 }
 
 async function saveSettings() {
   const num      = parseInt(document.getElementById('cfgNum').value);
-  const deviceId = document.getElementById('cfgDevice').value.trim();
+  const deviceId1 = document.getElementById('cfgDevice1').value.trim();
+  const deviceId2 = document.getElementById('cfgDevice2').value.trim();
   await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({num, device_id: deviceId})});
+    body: JSON.stringify({num, device_id_1: deviceId1, device_id_2: deviceId2})});
   const el = document.getElementById('settingsSaved');
   el.style.display = 'inline';
   setTimeout(()=>el.style.display='none', 2000);

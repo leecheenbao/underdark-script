@@ -45,6 +45,32 @@ def get_default_device():
     return settings["emulators"][default_key]["id"]
 
 
+def get_all_devices(max_count: int | None = None):
+    """取得所有已設定設備（依 key 由小到大），回傳 [{'key','id','name'}]。"""
+    settings = _load()
+    emulators = settings.get("emulators", {})
+    keys = sorted(emulators.keys(), key=lambda x: int(str(x)) if str(x).isdigit() else str(x))
+    items = []
+    for key in keys:
+        row = emulators.get(key) or {}
+        dev_id = str(row.get("id", "")).strip()
+        if not dev_id:
+            continue
+        items.append({
+            "key": str(key),
+            "id": dev_id,
+            "name": str(row.get("name") or f"模擬器{key}"),
+        })
+    if max_count is not None:
+        return items[:max(0, int(max_count))]
+    return items
+
+
+def get_run_device_ids(max_count: int = 2):
+    """取得要執行的設備 ID 清單（預設最多 2 台）。"""
+    return [x["id"] for x in get_all_devices(max_count=max_count)]
+
+
 def get_proxy():
     """取得代理配置 {"host": "10.0.2.2", "port": 8080}"""
     return _load()["proxy"]

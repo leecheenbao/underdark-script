@@ -7,6 +7,10 @@ import sys
 import os
 import time
 import io
+import argparse
+import subprocess
+import threading
+import queue
 from collections import Counter
 
 import cv2
@@ -32,10 +36,10 @@ from utils import (
 
 # ========== 配置區 ==========
 # 設備 ID（從 settings.json 讀取）
-from settings import get_default_device
+from settings import get_default_device, get_all_devices
 
 DEVICE_ID = get_default_device()
-NUM = 500
+NUM = 5000
 
 # 圖片路徑（相對於 pic 目錄）
 IMG = {
@@ -750,17 +754,33 @@ def run_fight(fight_no=None):
     return True, pet_full_seen
 
 
-def main():
-    """主入口"""
+def _ensure_device_connected(dev_id: str):
+    """嘗試 adb connect（TCP 設備），失敗不阻斷，交由 connect_device 最終驗證。"""
+    text = str(dev_id or "").strip()
+    if not text:
+        return
+    if ":" not in text:
+        return
+    try:
+        subprocess.run(["adb", "connect", text], capture_output=True, text=True)
+    except Exception:
+        pass
+
+
+def _run_single_device(dev_id: str, worker_name: str = ""):
+    """單設備執行主流程（供主程序與子程序共用）。"""
+    tag = f"[{worker_name}] " if worker_name else ""
+
     # 僅 send_telegram 推到 TG，一般 log 留在本機終端機
     set_telegram_log_forward(False)
 
     log("=" * 50)
-    log("Under Dark 自動戰鬥腳本")
+    log(f"{tag}Under Dark 自動戰鬥腳本")
     log("=" * 50)
-    send_telegram(f"開始腳本, 預計執行{NUM}次戰鬥")
+    send_telegram(f"{tag}開始腳本, 預計執行{NUM}次戰鬥")
 
-    connect_device(DEVICE_ID)
+    _ensure_device_connected(dev_id)
+    connect_device(dev_id)
 
     success_count    = 0
     fail_count       = 0
@@ -769,7 +789,7 @@ def main():
 
     for i in range(NUM):
         log("=" * 50)
-        log(f"第 {i+1}/{NUM} 次戰鬥開始（成功 {success_count} / 失敗 {fail_count}）")
+        log(f"{tag}第 {i+1}/{NUM} 次戰鬥開始（成功 {success_count} / 失敗 {fail_count}）")
         log("=" * 50)
         try:
             result = run_fight(fight_no=i + 1)
@@ -781,30 +801,99 @@ def main():
             else:
                 fail_count += 1
                 consecutive_fail += 1
-                log(f"[警告] 第 {i+1} 次戰鬥回傳失敗（連續 {consecutive_fail}/{MAX_CONSECUTIVE}），繼續下一輪")
+                log(f"{tag}[警告] 第 {i+1} 次戰鬥回傳失敗（連續 {consecutive_fail}/{MAX_CONSECUTIVE}），繼續下一輪")
         except Exception as exc:
             fail_count += 1
             consecutive_fail += 1
-            log(f"[異常] 第 {i+1} 次戰鬥拋出例外: {exc}（連續 {consecutive_fail}/{MAX_CONSECUTIVE}）")
+            log(f"{tag}[異常] 第 {i+1} 次戰鬥拋出例外: {exc}（連續 {consecutive_fail}/{MAX_CONSECUTIVE}）")
             time.sleep(2)
 
         log("=" * 50)
-        log(f"第 {i+1}/{NUM} 次戰鬥完成")
+        log(f"{tag}第 {i+1}/{NUM} 次戰鬥完成")
         log("=" * 50)
 
         # 連續失敗超過上限：發一則 TG 通知後停止，避免刷屏
         if consecutive_fail >= MAX_CONSECUTIVE:
             msg = f"連續失敗 {consecutive_fail} 次，腳本自動停止。請檢查設備與環境。（成功 {success_count} / 失敗 {fail_count} / 共 {i+1} 場）"
-            log(f"[停止] {msg}")
-            send_telegram(msg)
-            return
+            log(f"{tag}[停止] {msg}")
+            send_telegram(f"{tag}{msg}")
+            return 1
 
     summary = f"所有戰鬥完成：成功 {success_count} / 失敗 {fail_count} / 共 {NUM} 次"
     log("=" * 50)
-    log(summary)
+    log(f"{tag}{summary}")
     log("=" * 50)
-    send_telegram(f"腳本停止。{summary}")
+    send_telegram(f"{tag}腳本停止。{summary}")
+    return 0
+
+
+def _stream_worker_output(proc, prefix, out_q):
+    """讀取子程序輸出並轉交佇列。"""
+    for line in iter(proc.stdout.readline, ""):
+        out_q.put(f"[{prefix}] {line.rstrip()}")
+    out_q.put(f"[{prefix}] 程序結束，exit_code={proc.poll()}")
+
+
+def _run_multi_devices():
+    """多設備並行模式：最多同時跑兩台模擬器。"""
+    devices = get_all_devices(max_count=2)
+    if len(devices) <= 1:
+        only = devices[0]["id"] if devices else DEVICE_ID
+        only_name = devices[0]["name"] if devices else "模擬器1"
+        return _run_single_device(only, only_name)
+
+    log("=" * 50)
+    log("多設備模式啟動")
+    log("=" * 50)
+
+    workers = []
+    out_q = queue.Queue()
+    for idx, dev in enumerate(devices, start=1):
+        dev_id = dev["id"]
+        name = dev.get("name") or f"模擬器{idx}"
+        cmd = [sys.executable, "-u", os.path.abspath(__file__), "--device-id", dev_id, "--worker-name", name]
+        proc = subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        workers.append((proc, name, dev_id))
+        threading.Thread(target=_stream_worker_output, args=(proc, name, out_q), daemon=True).start()
+        log(f"[主控] 已啟動 {name}（{dev_id}），PID={proc.pid}")
+
+    running = len(workers)
+    while running > 0:
+        try:
+            line = out_q.get(timeout=0.5)
+            if line:
+                print(line)
+        except queue.Empty:
+            pass
+        running = sum(1 for p, _, _ in workers if p.poll() is None)
+
+    exit_codes = []
+    for p, name, dev_id in workers:
+        code = p.wait()
+        exit_codes.append(code)
+        log(f"[主控] {name}（{dev_id}）結束，exit_code={code}")
+    return 0 if all(c == 0 for c in exit_codes) else 1
+
+
+def main():
+    """主入口"""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--device-id", default="")
+    parser.add_argument("--worker-name", default="")
+    args, _ = parser.parse_known_args()
+
+    # 子程序（指定設備）走單設備流程；未指定則由主程序決定單/雙設備模式
+    if args.device_id:
+        return _run_single_device(args.device_id, args.worker_name)
+    return _run_multi_devices()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

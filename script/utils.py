@@ -9,6 +9,7 @@ import ssl
 import sys
 import time
 import os
+import zlib
 
 # Windows CP950/GBK 終端機無法印出 BMP 以外的 Unicode 字元（如 ≥ ≦ … 等）
 # 在模組載入時強制將 stdout/stderr 切換為 UTF-8，讓所有 log 不再崩潰
@@ -269,6 +270,100 @@ def get_device_id():
     return device_id
 
 
+def _atomic_write_bytes(target_path, data):
+    """先寫暫存檔再原子替換，避免讀到半寫入的 PNG。"""
+    folder = os.path.dirname(target_path) or "."
+    os.makedirs(folder, exist_ok=True)
+    tmp_path = os.path.join(
+        folder, f".{os.path.basename(target_path)}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        last_err = None
+        for _ in range(6):
+            try:
+                os.replace(tmp_path, target_path)
+                last_err = None
+                break
+            except PermissionError as ex:
+                # Windows 上若目標檔被短暫占用（防毒/索引/其他讀取）會失敗，短暫退避後重試
+                last_err = ex
+                time.sleep(0.02)
+        if last_err is not None:
+            # 最後退回直接覆寫，避免整個流程因瞬時鎖檔中斷
+            with open(target_path, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _is_valid_png_bytes(data):
+    """完整檢查 PNG chunk 長度/邊界/CRC，避免損壞圖交給 libpng。"""
+    if not data or len(data) < 33:
+        return False
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return False
+
+    pos = 8
+    seen_iend = False
+    data_len = len(data)
+    while pos + 12 <= data_len:
+        # length(4) + type(4) + data(length) + crc(4)
+        length = int.from_bytes(data[pos:pos + 4], "big", signed=False)
+        ctype = data[pos + 4:pos + 8]
+        chunk_start = pos + 8
+        chunk_end = chunk_start + length
+        crc_end = chunk_end + 4
+        if chunk_end > data_len or crc_end > data_len:
+            return False
+        payload = data[chunk_start:chunk_end]
+        crc_expected = int.from_bytes(data[chunk_end:crc_end], "big", signed=False)
+        crc_actual = zlib.crc32(ctype)
+        crc_actual = zlib.crc32(payload, crc_actual) & 0xFFFFFFFF
+        if crc_actual != crc_expected:
+            return False
+        pos = crc_end
+        if ctype == b"IEND":
+            seen_iend = True
+            break
+
+    # IEND 必須存在，且不得有多餘尾巴
+    return seen_iend and pos == data_len
+
+
+def _decode_png_bytes_safe(data):
+    """僅解碼已驗證通過的 PNG bytes，避免 libpng 報錯刷屏。"""
+    if not _is_valid_png_bytes(data):
+        return None
+    arr = np.frombuffer(data, np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def _imread_with_retry(path, retries=3, delay=0.04):
+    """先驗證 PNG 完整性再解碼，降低讀到半寫入檔時的 libpng 錯誤。"""
+    for i in range(max(1, int(retries))):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except Exception:
+            raw = b""
+        img = _decode_png_bytes_safe(raw)
+        if img is not None:
+            return img
+        if i < retries - 1:
+            time.sleep(delay)
+    return None
+
+
 def take_screenshot(save_path=None):
     """截取螢幕（純 adb 方式）
     使用 exec-out 直接 pipe，省去 push/pull/rm 三次往返，速度提升約 2-3 倍
@@ -277,14 +372,24 @@ def take_screenshot(save_path=None):
     if save_path is None:
         save_path = os.path.join(CACHE_DIR, "screen.png")
 
-    result = subprocess.run(
-        ["adb", "-s", device_id, "exec-out", "screencap", "-p"],
-        capture_output=True,
-    )
-    if result.returncode == 0 and result.stdout:
-        with open(save_path, "wb") as f:
-            f.write(result.stdout)
-        return save_path
+    for attempt in range(3):
+        result = subprocess.run(
+            ["adb", "-s", device_id, "exec-out", "screencap", "-p"],
+            capture_output=True,
+        )
+        if result.returncode == 0 and result.stdout:
+            png_bytes = result.stdout
+            if not _is_valid_png_bytes(png_bytes):
+                log(f"[截圖] exec-out PNG 檢查失敗，重試 {attempt + 1}/3")
+                time.sleep(0.05)
+                continue
+            # 僅對已驗證通過的 PNG 進行解碼確認
+            if _decode_png_bytes_safe(png_bytes) is None:
+                log(f"[截圖] exec-out PNG 解碼失敗，重試 {attempt + 1}/3")
+                time.sleep(0.05)
+                continue
+            _atomic_write_bytes(save_path, png_bytes)
+            return save_path
 
     # fallback：舊版 adb 不支援 exec-out 時退回三步驟
     remote_path = "/data/local/tmp/screen.png"
@@ -292,7 +397,7 @@ def take_screenshot(save_path=None):
         ["adb", "-s", device_id, "shell", "screencap", "-p", remote_path],
         capture_output=True,
     )
-    subprocess.run(
+    pull = subprocess.run(
         ["adb", "-s", device_id, "pull", remote_path, save_path],
         capture_output=True,
     )
@@ -300,7 +405,10 @@ def take_screenshot(save_path=None):
         ["adb", "-s", device_id, "shell", "rm", remote_path],
         capture_output=True,
     )
-    return save_path
+    # fallback 檔案也做一次讀取驗證，避免後續流程反覆報 libpng 錯誤
+    if pull.returncode == 0 and _imread_with_retry(save_path, retries=2) is not None:
+        return save_path
+    raise RuntimeError("截圖失敗：adb screencap 回傳無效 PNG")
 
 
 def load_and_match(template_path, threshold=0.8, screen_path=None, multiscale=False):
@@ -316,8 +424,8 @@ def load_and_match(template_path, threshold=0.8, screen_path=None, multiscale=Fa
     if not os.path.isabs(template_path):
         template_path = os.path.join(PIC_DIR, template_path)
     
-    img = cv2.imread(screen_path)
-    template = cv2.imread(template_path)
+    img = _imread_with_retry(screen_path, retries=3)
+    template = _imread_with_retry(template_path, retries=2)
     
     if img is None or template is None:
         return False, None, None, 0.0
@@ -371,6 +479,90 @@ def load_and_match(template_path, threshold=0.8, screen_path=None, multiscale=Fa
     del img, template
     gc.collect()
     return result
+
+
+def load_and_match_all_peaks(
+    template_path,
+    threshold=0.75,
+    screen_path=None,
+    multiscale=False,
+    max_peaks=12,
+    nms_factor=0.42,
+):
+    """
+    收集畫面上所有達閾值的模板中心 [(cx, cy, sim), ...]，由高到低；鄰近重複以 NMS 壓掉。
+    multiscale=True 時先依「單點最高分」選縮放（與 load_and_match 一致），再於該縮放下取多峰。
+    """
+    if screen_path is None:
+        screen_path = take_screenshot()
+    if not os.path.isabs(template_path):
+        template_path = os.path.join(PIC_DIR, template_path)
+    img = _imread_with_retry(screen_path, retries=3)
+    template = _imread_with_retry(template_path, retries=2)
+    if img is None or template is None:
+        return []
+
+    img_h, img_w = img.shape[:2]
+    final_tmpl = None
+    tw = th = 0
+
+    if multiscale:
+        th0, tw0 = template.shape[:2]
+        best_val = -1.0
+        best_scale = None
+        for scale in np.linspace(0.7, 1.3, 9):
+            rw = max(8, int(round(tw0 * scale)))
+            rh = max(8, int(round(th0 * scale)))
+            if rw >= img_w or rh >= img_h:
+                continue
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            tmpl = cv2.resize(template, (rw, rh), interpolation=interp)
+            res = cv2.matchTemplate(img, tmpl, cv2.TM_CCOEFF_NORMED)
+            _, mv, _, _ = cv2.minMaxLoc(res)
+            if mv > best_val:
+                best_val = mv
+                best_scale = scale
+            del tmpl, res
+        if best_scale is None or best_val < 0:
+            del img, template
+            gc.collect()
+            return []
+        rw = max(8, int(round(tw0 * best_scale)))
+        rh = max(8, int(round(th0 * best_scale)))
+        interp = cv2.INTER_AREA if best_scale < 1.0 else cv2.INTER_LINEAR
+        final_tmpl = cv2.resize(template, (rw, rh), interpolation=interp)
+        tw, th = rw, rh
+    else:
+        th, tw = template.shape[:2]
+        if tw >= img_w or th >= img_h:
+            del img, template
+            gc.collect()
+            return []
+        final_tmpl = template
+
+    res = cv2.matchTemplate(img, final_tmpl, cv2.TM_CCOEFF_NORMED)
+    work = res.copy()
+    mx_dist = max(int(tw * nms_factor), 8)
+    my_dist = max(int(th * nms_factor), 8)
+    peaks: list[tuple[int, int, float]] = []
+    for _ in range(max_peaks):
+        _, max_val, _, max_loc = cv2.minMaxLoc(work)
+        if max_val + MATCH_THRESHOLD_EPS < threshold:
+            break
+        cx = int(max_loc[0] + tw // 2)
+        cy = int(max_loc[1] + th // 2)
+        peaks.append((cx, cy, float(max_val)))
+        x0 = max(0, max_loc[0] - mx_dist)
+        y0 = max(0, max_loc[1] - my_dist)
+        x1 = min(work.shape[1], max_loc[0] + tw + mx_dist)
+        y1 = min(work.shape[0], max_loc[1] + th + my_dist)
+        work[y0:y1, x0:x1] = 0.0
+
+    del img, template, res, work
+    if multiscale:
+        del final_tmpl
+    gc.collect()
+    return peaks
 
 
 def click_by_image(img, threshold=0.8, delay=0.5, name="", show_log=True, multiscale=False):
@@ -764,6 +956,7 @@ __all__ = [
     'get_device_id',
     'take_screenshot',
     'load_and_match',
+    'load_and_match_all_peaks',
     'click_by_image',
     'image_exists',
     'wait_for_image',

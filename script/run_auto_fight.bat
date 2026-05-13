@@ -13,8 +13,8 @@ if errorlevel 1 (
 )
 
 echo.
-echo [執行] auto_fight.py ...
-py auto_fight.py
+echo [執行] auto_fight.py %*
+py auto_fight.py %*
 
 echo.
 pause
