@@ -1,13 +1,20 @@
 {
   "emulators": {
     "1": {
-      "id": "127.0.0.1:16385",
-      "name": "模拟器1"
+      "id": "127.0.0.1:16384",
+      "name": "模拟器1",
+      "mumu_vm_index": ""
     },
     "2": {
       "id": "127.0.0.1:16416",
-      "name": "模擬器2"
+      "name": "模擬器2",
+      "mumu_vm_index": ""
     }
+  },
+  "mumu": {
+    "manager_path": "",
+    "restart_wait_sec": 90,
+    "adb_boot_timeout_sec": 120
   },
   "default_emulator": "1",
   "proxy": {
@@ -15,7 +22,8 @@
     "port": 8080
   },
   "game": {
-    "package": "com.FreeDust.UnderDarkOffense"
+    "package": "com.FreeDust.UnderDarkOffense",
+    "activity": ""
   },
   "cert": {
     "hash": "c8750f0d",
@@ -28,5 +36,23 @@
   },
   "features": {
     "pet_full_check": true
+  },
+  "auto_recovery": {
+    "enabled": true,
+    "max_consecutive_fail": 3,
+    "max_recovery_per_session": 0,
+    "game_ready_timeout_sec": 180,
+    "web_auto_restart": true,
+    "web_restart_delay_sec": 8,
+    "restart_mode": "emulator",
+    "force_stop_wait_sec": 5,
+    "force_stop_retries": 3,
+    "launch_wait_sec": 15,
+    "use_game_icon_fallback": true,
+    "prefer_launch_via_icon": true,
+    "restart_script_after_recovery": true,
+    "restart_script_after_test": true,
+    "restart_emulator_on_recovery": true,
+    "restart_emulator_after_game_restart_fail": true
   }
 }

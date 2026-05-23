@@ -27,6 +27,7 @@ from utils import (
     click_by_image,
     image_exists,
     wait_for_image,
+    force_restart_game_emulator,
     wait_and_click,
     wait_and_click_any,
     wait_for_disappear,
@@ -38,7 +39,14 @@ from utils import (
 
 # ========== 配置區 ==========
 # 設備 ID（從 settings.json 讀取）
-from settings import get_default_device, get_all_devices, get_pet_full_check
+from settings import (
+    get_default_device,
+    get_all_devices,
+    get_pet_full_check,
+    get_auto_recovery,
+    get_game_package,
+    get_game_activity,
+)
 
 DEVICE_ID = get_default_device()
 NUM = 5000
@@ -1067,6 +1075,158 @@ def run_fight(fight_no=None):
     return True, _pet_full_pending
 
 
+def _force_restart_kwargs(cfg: dict, use_icon: bool) -> dict:
+    """組裝 force_restart_game_emulator 參數（與 settings.auto_recovery 一致）。"""
+    return {
+        "stop_wait": float(cfg.get("force_stop_wait_sec", 5)),
+        "launch_wait": float(cfg.get("launch_wait_sec", 15)),
+        "kill_retries": int(cfg.get("force_stop_retries", 3)),
+        "game_icon": "game_icon.png" if use_icon else None,
+        "prefer_launch_via_icon": bool(cfg.get("prefer_launch_via_icon", True)),
+    }
+
+
+def _recover_via_sl_ui(dev_id: str, tag: str) -> bool:
+    """備援：遊戲內設定離開後點桌面圖示（僅在模擬器強制重啟失敗時使用）。"""
+    try:
+        from sl_flow import restart_game_on_device_2
+
+        connect_device(dev_id)
+        return bool(restart_game_on_device_2(dev_id))
+    except Exception as exc:
+        log(f"{tag}[恢復] SL UI 重啟異常: {exc}")
+        return False
+
+
+def _emulator_key_for_device(dev_id: str) -> str | None:
+    """依 ADB 設備 ID 反查 settings.emulators 的 key。"""
+    for row in get_all_devices():
+        if str(row.get("id") or "").strip() == str(dev_id or "").strip():
+            return str(row.get("key") or "")
+    return None
+
+
+def _try_restart_emulator(dev_id: str, tag: str, emulator_key: str | None = None) -> bool:
+    """重啟整台模擬器（MuMuManager 或 adb reboot）。"""
+    try:
+        from emulator_control import restart_emulator
+
+        log(f"{tag}[恢復] 嘗試重啟模擬器（非僅遊戲）...")
+        return bool(restart_emulator(dev_id, emulator_key))
+    except Exception as exc:
+        log(f"{tag}[恢復] 重啟模擬器異常: {exc}")
+        return False
+
+
+def _restart_game_after_emulator(dev_id: str, tag: str, cfg: dict, use_icon: bool) -> bool:
+    """強制關閉並冷啟動遊戲（不含整機重啟）。"""
+    connect_device(dev_id)
+    return force_restart_game_emulator(
+        get_game_package(),
+        get_game_activity(),
+        **_force_restart_kwargs(cfg, use_icon),
+    )
+
+
+def _recover_device_after_failures(dev_id: str, tag: str) -> bool:
+    """
+    連續失敗後恢復（預設流程）：
+    1) 重啟整台模擬器（MuMuManager / adb reboot）
+    2) 冷啟動遊戲並等待營地 enter.png
+    3) 由呼叫端重新啟動戰鬥腳本程序繼續下一場
+    """
+    cfg = get_auto_recovery()
+    ready_timeout = int(cfg.get("game_ready_timeout_sec", 180))
+    restart_mode = str(cfg.get("restart_mode", "emulator")).strip().lower()
+    use_icon = bool(cfg.get("use_game_icon_fallback", True))
+    emu_key = _emulator_key_for_device(dev_id)
+    restart_emu_first = bool(cfg.get("restart_emulator_on_recovery", True))
+    restart_emu_on_fail = bool(cfg.get("restart_emulator_after_game_restart_fail", True))
+
+    log(f"{tag}[恢復] 開始恢復（裝置 {dev_id}）...")
+    send_telegram(f"{tag}連續失敗，開始恢復：重啟模擬器→重開遊戲→繼續腳本")
+
+    # ── 步驟 1：重啟整台模擬器 ──
+    if restart_emu_first:
+        flow_log("恢復", "1-模擬器", "重啟整台模擬器", status="...")
+        emu_ok = _try_restart_emulator(dev_id, tag, emu_key)
+        if emu_ok:
+            flow_log("恢復", "1-模擬器", "模擬器已重啟", status="OK")
+        else:
+            flow_log("恢復", "1-模擬器", "模擬器重啟失敗，改試僅重開遊戲", status="FAIL")
+            log(f"{tag}[恢復] 模擬器重啟失敗，仍嘗試重開遊戲...")
+
+    connect_device(dev_id)
+
+    # ── 步驟 2：冷啟動遊戲 ──
+    restarted = False
+    if restart_mode == "sl_ui":
+        flow_log("恢復", "2-遊戲", "SL UI 離開後重開", status="...")
+        restarted = _recover_via_sl_ui(dev_id, tag)
+    elif restart_mode in ("emulator", "emulator_then_sl"):
+        flow_log("恢復", "2-遊戲", "冷啟動遊戲", status="...")
+        try:
+            restarted = _restart_game_after_emulator(dev_id, tag, cfg, use_icon)
+        except Exception as exc:
+            log(f"{tag}[恢復] 冷啟動遊戲異常: {exc}")
+            restarted = False
+        # 未先重啟模擬器時：遊戲重開失敗再試整機重啟
+        if not restarted and (not restart_emu_first) and restart_emu_on_fail:
+            if _try_restart_emulator(dev_id, tag, emu_key):
+                connect_device(dev_id)
+                try:
+                    restarted = _restart_game_after_emulator(dev_id, tag, cfg, use_icon)
+                except Exception as exc:
+                    log(f"{tag}[恢復] 模擬器重啟後開遊戲失敗: {exc}")
+        if not restarted and restart_mode == "emulator_then_sl":
+            log(f"{tag}[恢復] 改試 SL UI...")
+            flow_log("恢復", "2-遊戲", "SL UI 離開後重開", status="...")
+            restarted = _recover_via_sl_ui(dev_id, tag)
+    else:
+        log(f"{tag}[恢復] 未知 restart_mode={restart_mode}，改用冷啟動遊戲")
+        try:
+            restarted = _restart_game_after_emulator(dev_id, tag, cfg, use_icon)
+        except Exception as exc:
+            log(f"{tag}[恢復] 冷啟動遊戲異常: {exc}")
+            restarted = False
+
+    if not restarted:
+        flow_log("恢復", "2-遊戲", "無法重開遊戲", status="FAIL")
+        log(f"{tag}[恢復] 恢復失敗")
+        return False
+
+    flow_log("恢復", "2-遊戲", "遊戲已重開", status="OK")
+    flow_log("恢復", "3-營地", f"等待 {IMG['enter']}", status="...")
+    log(f"{tag}[恢復] 等待營地主畫面（{IMG['enter']}，最長 {ready_timeout}s）...")
+    ready = wait_for_image(
+        IMG["enter"],
+        timeout=ready_timeout,
+        interval=1.0,
+        threshold=0.72,
+        multiscale=True,
+    )
+    if ready:
+        flow_log("恢復", "就緒", "地下城入口已可見", status="OK")
+        log(f"{tag}[恢復] 已回到營地主畫面，繼續執行腳本")
+        return True
+
+    flow_log("恢復", "就緒", "逾時未見地下城入口", status="FAIL")
+    log(f"{tag}[恢復] 重啟後仍無法確認營地主畫面")
+    return False
+
+
+def _restart_battle_script_process(dev_id: str, worker_name: str, resume_fight: int = 1):
+    """強制重啟遊戲後，重新啟動本戰鬥腳本程序（從指定場次繼續）。"""
+    resume_fight = max(1, int(resume_fight))
+    argv = [sys.executable, "-u", os.path.abspath(__file__), "--device-id", dev_id]
+    if worker_name:
+        argv += ["--worker-name", worker_name]
+    if resume_fight > 1:
+        argv += ["--resume-fight", str(resume_fight)]
+    log(f"[恢復] 重新啟動戰鬥腳本（從第 {resume_fight} 場繼續）...")
+    os.execv(sys.executable, argv)
+
+
 def _ensure_device_connected(dev_id: str):
     """嘗試 adb connect（TCP 設備），失敗不阻斷，交由 connect_device 最終驗證。"""
     text = str(dev_id or "").strip()
@@ -1080,17 +1240,31 @@ def _ensure_device_connected(dev_id: str):
         pass
 
 
-def _run_single_device(dev_id: str, worker_name: str = ""):
+def _run_single_device(dev_id: str, worker_name: str = "", resume_fight: int = 1):
     """單設備執行主流程（供主程序與子程序共用）。"""
+    global _pet_full_pending
     tag = f"[{worker_name}] " if worker_name else ""
 
     # 僅 send_telegram 推到 TG，一般 log 留在本機終端機
     set_telegram_log_forward(False)
 
+    recovery_cfg = get_auto_recovery()
+    auto_recovery_enabled = bool(recovery_cfg.get("enabled", True))
+    max_consecutive = int(recovery_cfg.get("max_consecutive_fail", 3))
+    max_recovery = int(recovery_cfg.get("max_recovery_per_session", 0))
+    restart_after_recovery = bool(recovery_cfg.get("restart_script_after_recovery", True))
+
+    start_idx = max(0, int(resume_fight) - 1)
+    total_planned = max(0, NUM - start_idx)
+
     log("=" * 50)
     log(f"{tag}Under Dark 自動戰鬥腳本")
     log("=" * 50)
-    send_telegram(f"{tag}開始腳本, 預計執行{NUM}次戰鬥")
+    if start_idx > 0:
+        send_telegram(f"{tag}恢復後繼續腳本，從第 {resume_fight} 場起（剩餘約 {total_planned} 場）")
+        log(f"{tag}從第 {resume_fight}/{NUM} 場繼續（恢復後重啟）")
+    else:
+        send_telegram(f"{tag}開始腳本, 預計執行{NUM}次戰鬥")
 
     _ensure_device_connected(dev_id)
     connect_device(dev_id)
@@ -1098,9 +1272,9 @@ def _run_single_device(dev_id: str, worker_name: str = ""):
     success_count    = 0
     fail_count       = 0
     consecutive_fail = 0          # 連續失敗計數
-    MAX_CONSECUTIVE  = 3          # 連續失敗上限，超過則停止腳本
+    recovery_count   = 0          # 本場次已執行恢復次數
 
-    for i in range(NUM):
+    for i in range(start_idx, NUM):
         log("=" * 50)
         log(f"{tag}第 {i+1}/{NUM} 次戰鬥開始（成功 {success_count} / 失敗 {fail_count}）")
         log("=" * 50)
@@ -1114,22 +1288,63 @@ def _run_single_device(dev_id: str, worker_name: str = ""):
             else:
                 fail_count += 1
                 consecutive_fail += 1
-                log(f"{tag}[警告] 第 {i+1} 次戰鬥回傳失敗（連續 {consecutive_fail}/{MAX_CONSECUTIVE}），繼續下一輪")
+                log(f"{tag}[警告] 第 {i+1} 次戰鬥回傳失敗（連續 {consecutive_fail}/{max_consecutive}），繼續下一輪")
         except Exception as exc:
             fail_count += 1
             consecutive_fail += 1
-            log(f"{tag}[異常] 第 {i+1} 次戰鬥拋出例外: {exc}（連續 {consecutive_fail}/{MAX_CONSECUTIVE}）")
+            log(f"{tag}[異常] 第 {i+1} 次戰鬥拋出例外: {exc}（連續 {consecutive_fail}/{max_consecutive}）")
             time.sleep(2)
 
         log("=" * 50)
         log(f"{tag}第 {i+1}/{NUM} 次戰鬥完成")
         log("=" * 50)
 
-        # 連續失敗超過上限：發一則 TG 通知後停止，避免刷屏
-        if consecutive_fail >= MAX_CONSECUTIVE:
-            msg = f"連續失敗 {consecutive_fail} 次，腳本自動停止。請檢查設備與環境。（成功 {success_count} / 失敗 {fail_count} / 共 {i+1} 場）"
-            log(f"{tag}[停止] {msg}")
+        # 連續失敗達上限：重啟遊戲並繼續（不再直接停止腳本）
+        if consecutive_fail >= max_consecutive:
+            if not auto_recovery_enabled:
+                msg = (
+                    f"連續失敗 {consecutive_fail} 次，腳本自動停止。"
+                    f"（成功 {success_count} / 失敗 {fail_count} / 共 {i+1} 場）"
+                )
+                log(f"{tag}[停止] {msg}")
+                send_telegram(f"{tag}{msg}")
+                return 1
+
+            recovery_count += 1
+            if max_recovery > 0 and recovery_count > max_recovery:
+                msg = (
+                    f"連續失敗 {consecutive_fail} 次，且本場次恢復已達上限 {max_recovery} 次，停止腳本。"
+                    f"（成功 {success_count} / 失敗 {fail_count} / 共 {i+1} 場）"
+                )
+                log(f"{tag}[停止] {msg}")
+                send_telegram(f"{tag}{msg}")
+                return 1
+
+            msg = (
+                f"連續失敗 {consecutive_fail} 次，第 {recovery_count} 次自動恢復："
+                f"重啟模擬器→重開遊戲→繼續腳本（成功 {success_count} / 失敗 {fail_count}）"
+            )
+            log(f"{tag}[恢復] {msg}")
             send_telegram(f"{tag}{msg}")
+
+            _pet_full_pending = False
+            if _recover_device_after_failures(dev_id, tag):
+                consecutive_fail = 0
+                connect_device(dev_id)
+                retry_fight = i + 1  # 重試本輪失敗的場次（1-based）
+                if restart_after_recovery:
+                    log(f"{tag}[恢復] 恢復成功，重新啟動戰鬥腳本（從第 {retry_fight} 場）")
+                    send_telegram(f"{tag}恢復完成，重新啟動戰鬥腳本（第 {retry_fight} 場起）")
+                    _restart_battle_script_process(dev_id, worker_name, resume_fight=retry_fight)
+                log(f"{tag}[恢復] 恢復成功，從第 {retry_fight}/{NUM} 輪繼續")
+                continue
+
+            fail_msg = (
+                f"連續失敗 {consecutive_fail} 次且恢復失敗，腳本停止。"
+                f"（成功 {success_count} / 失敗 {fail_count} / 共 {i+1} 場）"
+            )
+            log(f"{tag}[停止] {fail_msg}")
+            send_telegram(f"{tag}{fail_msg}")
             return 1
 
     summary = f"所有戰鬥完成：成功 {success_count} / 失敗 {fail_count} / 共 {NUM} 次"
@@ -1225,6 +1440,8 @@ def main():
     parser.add_argument("--worker-name", default="")
     parser.add_argument("--test-pet-flow", action="store_true",
                         help="測試模式：直接執行一次滿包合成流程後退出")
+    parser.add_argument("--resume-fight", type=int, default=1,
+                        help="從第 N 場戰鬥繼續（恢復後重啟腳本時使用）")
     args, _ = parser.parse_known_args()
 
     # 測試模式：直接跑合成流程
@@ -1233,7 +1450,11 @@ def main():
 
     # 子程序（指定設備）走單設備流程；未指定則由主程序決定單/雙設備模式
     if args.device_id:
-        return _run_single_device(args.device_id, args.worker_name)
+        return _run_single_device(
+            args.device_id,
+            args.worker_name,
+            resume_fight=max(1, int(args.resume_fight or 1)),
+        )
     return _run_multi_devices()
 
 

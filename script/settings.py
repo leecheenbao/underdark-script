@@ -81,6 +81,23 @@ def get_game_package():
     return _load()["game"]["package"]
 
 
+def get_game_activity():
+    """取得遊戲啟動 Activity（可為空，由 adb monkey / MainActivity 處理）"""
+    game = _load().get("game") or {}
+    return str(game.get("activity") or "").strip() or None
+
+
+def get_mumu_config() -> dict:
+    """MuMu 模擬器控制設定（MuMuManager 路徑、重啟等待時間等）。"""
+    defaults = {
+        "manager_path": "",
+        "restart_wait_sec": 90,
+        "adb_boot_timeout_sec": 120,
+    }
+    cfg = _load().get("mumu") or {}
+    return {**defaults, **cfg}
+
+
 def get_cert_config():
     """取得憑證配置 {"hash": "...", "pem_path": "..."}"""
     return _load()["cert"]
@@ -99,6 +116,31 @@ def get_features() -> dict:
 def get_pet_full_check() -> bool:
     """道具欄滿包偵測開關（預設 True）"""
     return bool(get_features().get("pet_full_check", True))
+
+
+def get_auto_recovery() -> dict:
+    """連續失敗時自動恢復（重啟遊戲／Web 自動重啟腳本）設定。"""
+    defaults = {
+        "enabled": True,
+        "max_consecutive_fail": 3,
+        "max_recovery_per_session": 0,  # 0=不限制本場次恢復次數
+        "game_ready_timeout_sec": 180,
+        "web_auto_restart": True,
+        "web_restart_delay_sec": 8,
+        # emulator=adb 強制結束重開；sl_ui=僅遊戲內設定離開；emulator_then_sl=先模擬器再 SL
+        "restart_mode": "emulator",
+        "force_stop_wait_sec": 5,
+        "force_stop_retries": 3,
+        "launch_wait_sec": 15,
+        "use_game_icon_fallback": True,
+        "prefer_launch_via_icon": True,
+        "restart_script_after_recovery": True,
+        "restart_script_after_test": True,
+        "restart_emulator_on_recovery": True,
+        "restart_emulator_after_game_restart_fail": True,
+    }
+    cfg = _load().get("auto_recovery") or {}
+    return {**defaults, **cfg}
 
 
 def set_pet_full_check(enabled: bool):

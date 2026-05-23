@@ -68,6 +68,10 @@ app = Flask(__name__)
 
 _proc: subprocess.Popen | None = None
 _proc_lock = threading.Lock()
+_last_start_kw: dict = {}          # 供 Web 監看執行緒異常結束後自動重啟
+_auto_restart_allowed: bool = False  # 測試模式／SL 流程不自動重啟
+_force_restart_lock = threading.Lock()
+_force_restart_running = False
 _log_queue: queue.Queue = queue.Queue(maxsize=2000)
 _log_history: list[str] = []          # 保留最近 500 條給新連線
 _log_lock = threading.Lock()
@@ -96,6 +100,55 @@ def _read_stream(stream):
     _enqueue_log("[腳本] 程序已結束")
 
 
+def _script_watchdog_loop():
+    """腳本異常結束時，依 settings 自動重新啟動（需先前由 Web 正常啟動過）。"""
+    while True:
+        time.sleep(3)
+        with _proc_lock:
+            proc = _proc
+            allowed = _auto_restart_allowed
+            params = dict(_last_start_kw)
+
+        if proc is None:
+            continue
+        exit_code = proc.poll()
+        if exit_code is None:
+            continue
+
+        # 僅處理一次該次程序結束，避免 sleep 期間重複觸發自動重啟
+        with _proc_lock:
+            if _proc is not proc:
+                continue
+            _proc = None
+
+        if not allowed or not params:
+            continue
+        if exit_code == 0:
+            continue
+
+        try:
+            from settings import get_auto_recovery
+
+            cfg = get_auto_recovery()
+        except Exception:
+            cfg = {}
+        if not cfg.get("web_auto_restart", True):
+            continue
+
+        delay = float(cfg.get("web_restart_delay_sec", 8))
+        _enqueue_log(
+            f"[系統] 腳本異常結束 exit_code={exit_code}，{delay:.0f}s 後自動重啟..."
+        )
+        time.sleep(delay)
+
+        with _proc_lock:
+            if _proc is not None and _proc.poll() is None:
+                continue
+
+        ok, msg = start_script(**params)
+        _enqueue_log(f"[系統] 自動重啟結果: {msg}" if ok else f"[系統] 自動重啟失敗: {msg}")
+
+
 def start_script(
     num: int | None = None,
     device_id: str | None = None,
@@ -108,7 +161,7 @@ def start_script(
     extra_args: 附加命令列參數（如 ['--test-pet-flow']），
                 有附加參數時直接用 sys.executable 執行，略過 bat 設備檢查。
     """
-    global _proc
+    global _proc, _last_start_kw, _auto_restart_allowed
     with _proc_lock:
         if _proc and _proc.poll() is None:
             return False, "腳本已在執行中"
@@ -119,6 +172,8 @@ def start_script(
 
         # ── 測試模式（有 extra_args）：直接用 python 執行，不走 bat ──
         if extra_args:
+            _auto_restart_allowed = False
+            _last_start_kw = {}
             cmd = [sys.executable, AUTO_FIGHT_PY] + extra_args
             try:
                 _proc = subprocess.Popen(
@@ -174,6 +229,14 @@ def start_script(
         except Exception as e:
             return False, str(e)
 
+        _auto_restart_allowed = True
+        _last_start_kw = {
+            "num": num,
+            "device_id": device_id,
+            "device_id_1": device_id_1,
+            "device_id_2": device_id_2,
+            "extra_args": None,
+        }
         threading.Thread(target=_read_stream, args=(_proc.stdout,), daemon=True).start()
         _enqueue_log(f"[系統] 腳本已啟動（第一組設備: {run_device}, PID {_proc.pid}）")
         return True, f"腳本已啟動（第一組設備: {run_device}, PID {_proc.pid}）"
@@ -645,6 +708,200 @@ def api_test_pet_flow():
     return jsonify({"ok": ok, "message": msg})
 
 
+def _read_auto_fight_num() -> int | None:
+    """讀取 auto_fight.py 的 NUM 值。"""
+    try:
+        with open(AUTO_FIGHT_PY, encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("NUM") and "=" in s:
+                    return int(s.split("=", 1)[1].strip())
+    except Exception:
+        pass
+    return None
+
+
+def _start_battle_script_after_recovery(device_id: str | None = None) -> tuple[bool, str]:
+    """強制重啟完成後，重新啟動戰鬥腳本。"""
+    from settings import get_auto_recovery
+
+    if not get_auto_recovery().get("restart_script_after_test", True):
+        return False, "已略過（restart_script_after_test=false）"
+
+    with _proc_lock:
+        if _proc and _proc.poll() is None:
+            return False, "腳本已在執行中"
+
+    num = _read_auto_fight_num()
+    cur = _read_current_devices() or {}
+    dev1 = str(device_id or cur.get("device_id_1") or "").strip()
+    dev2 = str(cur.get("device_id_2") or "").strip()
+
+    return start_script(
+        num=num,
+        device_id_1=dev1 or None,
+        device_id_2=dev2 or None,
+    )
+
+
+def _resolve_test_device_id(device_id: str | None = None) -> str:
+    """測試用：解析要連線的 ADB 設備 ID（優先參數，其次設定 #1）。"""
+    text = str(device_id or "").strip()
+    if text:
+        return text
+    cur = _read_current_devices() or {}
+    dev = str(cur.get("device_id_1") or "").strip()
+    if dev:
+        return dev
+    raise ValueError("未設定 ADB 設備 ID #1，請先到設定頁填入")
+
+
+def _force_restart_test_worker(device_id: str | None = None):
+    """背景執行：模擬器 adb 強制重啟遊戲並等待 enter.png。"""
+    global _force_restart_running
+    try:
+        from settings import get_auto_recovery, get_game_package, get_game_activity
+        from utils import connect_device, force_restart_game_emulator, wait_for_image
+
+        dev = _resolve_test_device_id(device_id)
+        cfg = get_auto_recovery()
+        ready_timeout = int(cfg.get("game_ready_timeout_sec", 180))
+        use_icon = bool(cfg.get("use_game_icon_fallback", True))
+
+        _enqueue_log("=" * 50)
+        _enqueue_log(f"[測試] 強制重啟遊戲開始（裝置 {dev}）")
+        _enqueue_log("=" * 50)
+
+        if ":" in dev:
+            try:
+                subprocess.run(["adb", "connect", dev], capture_output=True, text=True, timeout=15)
+            except Exception:
+                pass
+
+        connect_device(dev)
+        ok = force_restart_game_emulator(
+            get_game_package(),
+            get_game_activity(),
+            stop_wait=float(cfg.get("force_stop_wait_sec", 5)),
+            launch_wait=float(cfg.get("launch_wait_sec", 15)),
+            kill_retries=int(cfg.get("force_stop_retries", 3)),
+            game_icon="game_icon.png" if use_icon else None,
+            prefer_launch_via_icon=bool(cfg.get("prefer_launch_via_icon", True)),
+        )
+        if not ok:
+            _enqueue_log("[測試] ❌ 強制重啟流程失敗")
+            return
+
+        _enqueue_log(f"[測試] 等待營地主畫面 enter.png（最長 {ready_timeout}s）...")
+        ready = wait_for_image(
+            "enter.png",
+            timeout=ready_timeout,
+            interval=1.0,
+            threshold=0.72,
+            multiscale=True,
+        )
+        if ready:
+            _enqueue_log("[測試] ✅ 成功：已偵測到地下城入口 enter.png")
+        else:
+            _enqueue_log("[測試] ⚠️ 遊戲已重啟，但未匹配 enter.png（請檢查模板或調高載入等待）")
+
+        _enqueue_log("[測試] 正在重新啟動戰鬥腳本...")
+        ok_script, msg_script = _start_battle_script_after_recovery(dev)
+        if ok_script:
+            _enqueue_log(f"[測試] ✅ 戰鬥腳本已啟動：{msg_script}")
+        else:
+            _enqueue_log(f"[測試] ⚠️ 未能啟動戰鬥腳本：{msg_script}")
+
+        _enqueue_log("[測試] 強制重啟測試結束")
+        _enqueue_log("=" * 50)
+    except Exception as exc:
+        _enqueue_log(f"[測試] ❌ 強制重啟異常: {exc}")
+    finally:
+        with _force_restart_lock:
+            _force_restart_running = False
+
+
+def _restart_emulator_test_worker(device_id: str | None = None, emulator_key: str | None = None):
+    """背景執行：重啟整台模擬器並等待 ADB。"""
+    global _force_restart_running
+    try:
+        from emulator_control import find_mumu_manager_path, restart_emulator
+
+        dev = _resolve_test_device_id(device_id)
+        key = str(emulator_key or "1").strip() or "1"
+
+        _enqueue_log("=" * 50)
+        _enqueue_log(f"[測試] 重啟模擬器開始（裝置 {dev}，emulator key={key}）")
+        mgr = find_mumu_manager_path()
+        if mgr:
+            _enqueue_log(f"[測試] 使用 MuMuManager: {mgr}")
+        else:
+            _enqueue_log("[測試] 未找到 MuMuManager，將改用 adb reboot")
+
+        ok = restart_emulator(dev, key)
+        if ok:
+            _enqueue_log("[測試] ✅ 模擬器重啟完成，ADB 已就緒")
+        else:
+            _enqueue_log("[測試] ❌ 模擬器重啟失敗")
+        _enqueue_log("=" * 50)
+    except Exception as exc:
+        _enqueue_log(f"[測試] ❌ 重啟模擬器異常: {exc}")
+    finally:
+        with _force_restart_lock:
+            _force_restart_running = False
+
+
+@app.route("/api/script/test-restart-emulator", methods=["POST"])
+def api_test_restart_emulator():
+    """測試重啟整台模擬器（MuMuManager restart 或 adb reboot）。"""
+    global _force_restart_running
+    with _proc_lock:
+        if _proc and _proc.poll() is None:
+            return jsonify({"ok": False, "message": "腳本執行中，請先停止後再測試"}), 400
+    with _force_restart_lock:
+        if _force_restart_running:
+            return jsonify({"ok": False, "message": "測試執行中，請稍候"}), 400
+        _force_restart_running = True
+
+    body = request.json or {}
+    device_id = body.get("device_id") or body.get("device_id_1")
+    emulator_key = body.get("emulator_key") or "1"
+    threading.Thread(
+        target=_restart_emulator_test_worker,
+        args=(device_id, emulator_key),
+        daemon=True,
+    ).start()
+    return jsonify({
+        "ok": True,
+        "message": "已開始重啟模擬器，請在 Log 查看進度（約 1～2 分鐘）",
+    })
+
+
+@app.route("/api/script/test-force-restart", methods=["POST"])
+def api_test_force_restart():
+    """測試模擬器 adb 強制結束並重開遊戲（背景執行，Log 即時顯示）。"""
+    global _force_restart_running
+    with _proc_lock:
+        if _proc and _proc.poll() is None:
+            return jsonify({"ok": False, "message": "腳本執行中，請先停止後再測試"}), 400
+    with _force_restart_lock:
+        if _force_restart_running:
+            return jsonify({"ok": False, "message": "強制重啟測試執行中，請稍候"}), 400
+        _force_restart_running = True
+
+    body = request.json or {}
+    device_id = body.get("device_id") or body.get("device_id_1")
+    threading.Thread(
+        target=_force_restart_test_worker,
+        args=(device_id,),
+        daemon=True,
+    ).start()
+    return jsonify({
+        "ok": True,
+        "message": "已開始測試強制重啟，請切換至「腳本執行」分頁查看 Log",
+    })
+
+
 @app.route("/api/script/logs/stream")
 def api_logs_stream():
     """SSE：即時推送 log 行"""
@@ -1091,6 +1348,29 @@ header h1{font-size:1.05rem;color:var(--accent);white-space:nowrap}
         </div>
       </div>
       <div id="testPetResult" style="font-size:.78rem;margin-top:8px;display:none"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">恢復流程測試</div>
+      <div style="font-size:.78rem;color:var(--muted);margin-bottom:10px;line-height:1.6">
+        連續失敗恢復預設流程：<strong>重啟模擬器</strong> → 冷啟動遊戲 → 等待 <code>enter.png</code> → 繼續戰鬥腳本。<br>
+        下方「測試強制重啟遊戲」僅測步驟 2；「測試重啟模擬器」僅測步驟 1。<br>
+        <span style="color:var(--muted)">請確認 <code>pic/game_icon.png</code> 是 MuMu 桌面上的遊戲圖示，不是遊戲內按鈕。</span>
+      </div>
+      <button class="btn btn-orange" id="btnTestForceRestart" onclick="runTestForceRestart()"
+              style="padding:6px 14px;font-size:.8rem" title="測試 adb 強制結束並重開遊戲">
+        🔄 測試強制重啟遊戲
+      </button>
+      <button class="btn btn-gray" id="btnTestRestartEmu" onclick="runTestRestartEmulator()"
+              style="padding:6px 14px;font-size:.8rem;margin-left:8px" title="重啟整台 MuMu 模擬器（非僅遊戲）">
+        🖥 測試重啟模擬器
+      </button>
+      <div id="testForceRestartResult" style="font-size:.78rem;margin-top:8px;display:none"></div>
+      <div id="testRestartEmuResult" style="font-size:.78rem;margin-top:8px;display:none"></div>
+      <div style="font-size:.72rem;color:var(--muted);margin-top:8px;line-height:1.5">
+        模擬器重啟需 MuMu 12 的 <code>MuMuManager.exe</code>，路徑填在 <code>settings.json → mumu.manager_path</code>；
+        或於 <code>emulators.N.mumu_vm_index</code> 手動填索引（0、1…）。
+      </div>
     </div>
 
     <div class="card">
@@ -1701,6 +1981,66 @@ async function runTestPetFlow() {
   }
 }
 
+async function runTestRestartEmulator() {
+  const btn = document.getElementById('btnTestRestartEmu');
+  const info = document.getElementById('testRestartEmuResult');
+  const deviceId1 = document.getElementById('cfgDevice1')?.value?.trim() || '';
+
+  btn.disabled = true;
+  btn.textContent = '⏳ 重啟中...';
+  info.style.display = 'block';
+  info.style.color = 'var(--orange)';
+  info.textContent = '模擬器重啟中（約 1～2 分鐘），請觀察 Log...';
+
+  const resp = await fetch('/api/script/test-restart-emulator', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({device_id_1: deviceId1, emulator_key: '1'}),
+  });
+  const d = await resp.json();
+
+  btn.disabled = false;
+  btn.textContent = '🖥 測試重啟模擬器';
+  if (d.ok) {
+    info.style.color = 'var(--green)';
+    info.textContent = '✅ ' + d.message;
+    switchTab('tabScript');
+  } else {
+    info.style.color = '#e74c3c';
+    info.textContent = '❌ ' + d.message;
+  }
+}
+
+async function runTestForceRestart() {
+  const btn = document.getElementById('btnTestForceRestart');
+  const info = document.getElementById('testForceRestartResult');
+  const deviceId1 = document.getElementById('cfgDevice1')?.value?.trim() || '';
+
+  btn.disabled = true;
+  btn.textContent = '⏳ 執行中...';
+  info.style.display = 'block';
+  info.style.color = 'var(--orange)';
+  info.textContent = '測試中（約 15～180 秒），請觀察「腳本執行」分頁 Log...';
+
+  const resp = await fetch('/api/script/test-force-restart', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({device_id_1: deviceId1}),
+  });
+  const d = await resp.json();
+
+  btn.disabled = false;
+  btn.textContent = '🔄 測試強制重啟遊戲';
+  if (d.ok) {
+    info.style.color = 'var(--green)';
+    info.textContent = '✅ ' + d.message;
+    switchTab('tabScript');
+  } else {
+    info.style.color = '#e74c3c';
+    info.textContent = '❌ ' + d.message;
+  }
+}
+
 // 預先載入設定到 Header 的啟動按鈕用
 loadSettings();
 </script>
@@ -1722,5 +2062,6 @@ if __name__ == "__main__":
     print("Under Dark 控制台  http://127.0.0.1:5050")
     print("按 Ctrl+C 停止")
     print("=" * 50)
+    threading.Thread(target=_script_watchdog_loop, daemon=True).start()
     threading.Thread(target=open_browser, daemon=True).start()
     app.run(host="127.0.0.1", port=5050, debug=False, threaded=True)

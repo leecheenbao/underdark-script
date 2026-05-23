@@ -602,9 +602,9 @@ def click_by_image(img, threshold=0.8, delay=0.5, name="", show_log=True, multis
         return False
 
 
-def image_exists(img, threshold=0.8):
+def image_exists(img, threshold=0.8, multiscale=False):
     """檢查圖片是否存在於螢幕上"""
-    found, _, _, _ = load_and_match(img, threshold)
+    found, _, _, _ = load_and_match(img, threshold, multiscale=multiscale)
     return found
 
 
@@ -919,6 +919,164 @@ def restart_app(package_name, activity_name=None, wait_time=3):
     log("應用程式重啟完成")
 
 
+def _adb_shell(args: list[str], *, device: str | None = None) -> subprocess.CompletedProcess:
+    """對目前裝置執行 adb shell 子命令。"""
+    dev = device or device_id
+    return subprocess.run(
+        ["adb", "-s", dev, "shell", *args],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _game_process_running(package_name: str) -> bool:
+    """檢查遊戲程序是否仍在運行（pidof / ps）。"""
+    r = _adb_shell(["pidof", package_name])
+    if (r.stdout or "").strip():
+        return True
+    r2 = _adb_shell(["ps", "-A"])
+    blob = f"{r2.stdout or ''}\n{r2.stderr or ''}"
+    return package_name in blob
+
+
+def _resolve_launcher_component(package_name: str) -> str | None:
+    """解析套件預設 Launcher Activity（供 am start -S 冷啟動）。"""
+    r = _adb_shell(["cmd", "package", "resolve-activity", "--brief", package_name])
+    lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        if "/" in ln and package_name in ln:
+            return ln
+    return None
+
+
+def _force_kill_game_package(
+    package_name: str,
+    *,
+    stop_wait: float = 3.0,
+    kill_retries: int = 3,
+) -> bool:
+    """
+    徹底關閉遊戲：多次 force-stop + kill，確認程序結束後回到模擬器桌面。
+    僅按 HOME 無法關閉遊戲，必須先 force-stop。
+    """
+    log(f"[模擬器] 強制關閉遊戲程序: {package_name}")
+    flow_log("恢復", "模擬器", f"force-stop ×{kill_retries}", status="...")
+
+    for round_no in range(1, max(1, int(kill_retries)) + 1):
+        _adb_shell(["am", "force-stop", package_name])
+        _adb_shell(["am", "kill", package_name])
+        time.sleep(0.7)
+        if not _game_process_running(package_name):
+            log(f"[模擬器] 第 {round_no} 次關閉後，程序已結束")
+            break
+        log(f"[模擬器] 第 {round_no} 次關閉後程序仍在，重試...")
+
+    # 回到模擬器桌面（避免仍在遊戲畫面內點 icon 只切回舊程序）
+    for _ in range(3):
+        _adb_shell(["input", "keyevent", "3"])  # KEYCODE_HOME
+        time.sleep(0.4)
+
+    time.sleep(float(stop_wait))
+
+    if _game_process_running(package_name):
+        log(f"[模擬器][警告] 遊戲程序可能仍在背景，最後再 force-stop 一次")
+        _adb_shell(["am", "force-stop", package_name])
+        time.sleep(1.0)
+
+    alive = _game_process_running(package_name)
+    if alive:
+        log(f"[模擬器][FAIL] 無法完全關閉遊戲: {package_name}")
+        flow_log("恢復", "模擬器", "遊戲程序仍未關閉", status="FAIL")
+        return False
+
+    log("[模擬器] 已確認遊戲程序已關閉，目前在模擬器桌面")
+    flow_log("恢復", "模擬器", "遊戲已關閉", status="OK")
+    return True
+
+
+def _cold_start_game(package_name: str, activity_name: str | None = None) -> bool:
+    """冷啟動遊戲（am start -S：啟動前先 force-stop，避免恢復卡住畫面）。"""
+    component = (activity_name or "").strip()
+    if component and "/" not in component:
+        if component.startswith("."):
+            component = f"{package_name}{component}"
+        elif "." in component:
+            component = f"{package_name}/{component}"
+        else:
+            component = f"{package_name}/{component}"
+    if not component:
+        component = _resolve_launcher_component(package_name) or f"{package_name}/.MainActivity"
+
+    r = _adb_shell(["am", "start", "-S", "-W", "-n", component])
+    out = f"{r.stdout or ''}{r.stderr or ''}"
+    if r.returncode == 0 and "Error" not in out and "Exception" not in out:
+        log(f"[模擬器] 冷啟動成功: {component}")
+        return True
+
+    log(f"[模擬器] 冷啟動失敗 ({component})，輸出: {out.strip()[:200]}")
+    return False
+
+
+def force_restart_game_emulator(
+    package_name: str,
+    activity_name: str | None = None,
+    *,
+    stop_wait: float = 3.0,
+    launch_wait: float = 12.0,
+    kill_retries: int = 3,
+    game_icon: str | None = None,
+    game_icon_wait: float = 30.0,
+    prefer_launch_via_icon: bool = True,
+) -> bool:
+    """
+    透過模擬器 adb 真正關閉並冷啟動遊戲。
+    流程：force-stop 確認結束 → HOME 到桌面 → 點 game_icon 或 am start -S。
+    不使用 monkey（易恢復舊畫面而非重新啟動）。
+    """
+    if not package_name:
+        log("[模擬器] 未設定遊戲套件名，無法強制重啟")
+        return False
+
+    if not _force_kill_game_package(
+        package_name,
+        stop_wait=stop_wait,
+        kill_retries=kill_retries,
+    ):
+        return False
+
+    launched = False
+
+    # 優先從模擬器桌面點圖示（與手動重開一致）
+    if prefer_launch_via_icon and game_icon:
+        log(f"[模擬器] 等待桌面遊戲圖示 {game_icon} 並點擊冷啟動...")
+        if wait_and_click(
+            game_icon,
+            timeout=float(game_icon_wait),
+            interval=0.7,
+            threshold=0.74,
+            delay=1.2,
+            name="game_icon",
+            multiscale=True,
+            heartbeat_sec=5,
+        ):
+            launched = True
+            log("[模擬器] 已從桌面點擊遊戲圖示啟動")
+        else:
+            log("[模擬器] 桌面上找不到遊戲圖示，改試 adb 冷啟動")
+
+    if not launched:
+        launched = _cold_start_game(package_name, activity_name)
+
+    if not launched:
+        flow_log("恢復", "模擬器", "冷啟動失敗", status="FAIL")
+        return False
+
+    time.sleep(float(launch_wait))
+    flow_log("恢復", "模擬器", "遊戲已冷啟動", status="OK")
+    log("[模擬器] 強制重啟完成，等待遊戲載入至營地")
+    return True
+
+
 def send_wechat(title, message=""):
     """
     透過 PushPlus 發送微信通知
@@ -982,6 +1140,7 @@ __all__ = [
     'force_stop_app',
     'start_app',
     'restart_app',
+    'force_restart_game_emulator',
     'send_wechat',
     'send_telegram',
     'PIC_DIR',
