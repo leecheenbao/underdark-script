@@ -1,0 +1,12 @@
+# 執行時截圖與除錯快取（adb 截圖、模板比對除錯圖等）
+pic/cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# 本機設定與暫存（若含敏感資訊可取消註解）
+# script/settings.json

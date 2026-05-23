@@ -756,54 +756,72 @@ def _resolve_test_device_id(device_id: str | None = None) -> str:
     raise ValueError("未設定 ADB 設備 ID #1，請先到設定頁填入")
 
 
+def _launch_game_and_wait_camp(dev: str, cfg: dict, *, after_emulator_reboot: bool = False) -> bool:
+    """啟動遊戲並等待 enter.png（營地）。"""
+    from settings import get_game_activity, get_game_package
+    from utils import connect_device, force_restart_game_emulator, wait_for_image
+
+    ready_timeout = int(cfg.get("game_ready_timeout_sec", 180))
+    use_icon = bool(cfg.get("use_game_icon_fallback", True))
+
+    if ":" in dev:
+        try:
+            subprocess.run(["adb", "connect", dev], capture_output=True, text=True, timeout=15)
+        except Exception:
+            pass
+    connect_device(dev)
+
+    kw = dict(
+        stop_wait=float(cfg.get("force_stop_wait_sec", 5)),
+        launch_wait=float(cfg.get("launch_wait_sec", 15)),
+        kill_retries=int(cfg.get("force_stop_retries", 3)),
+        game_icon="game_icon.png" if use_icon else None,
+        prefer_launch_via_icon=bool(cfg.get("prefer_launch_via_icon", True)),
+    )
+    if after_emulator_reboot:
+        kw["skip_force_kill"] = True
+        kw["desktop_wait"] = float(cfg.get("desktop_wait_after_reboot_sec", 10))
+        kw["game_icon_wait"] = 45.0
+
+    ok = force_restart_game_emulator(
+        get_game_package(),
+        get_game_activity(),
+        **kw,
+    )
+    if not ok:
+        return False
+
+    _enqueue_log(f"[測試] 等待營地主畫面 enter.png（最長 {ready_timeout}s）...")
+    ready = wait_for_image(
+        "enter.png",
+        timeout=ready_timeout,
+        interval=1.0,
+        threshold=0.72,
+        multiscale=True,
+    )
+    if ready:
+        _enqueue_log("[測試] ✅ 已偵測到地下城入口 enter.png")
+    else:
+        _enqueue_log("[測試] ⚠️ 未匹配 enter.png（請檢查模板）")
+    return bool(ready)
+
+
 def _force_restart_test_worker(device_id: str | None = None):
     """背景執行：模擬器 adb 強制重啟遊戲並等待 enter.png。"""
     global _force_restart_running
     try:
-        from settings import get_auto_recovery, get_game_package, get_game_activity
-        from utils import connect_device, force_restart_game_emulator, wait_for_image
+        from settings import get_auto_recovery
 
         dev = _resolve_test_device_id(device_id)
         cfg = get_auto_recovery()
-        ready_timeout = int(cfg.get("game_ready_timeout_sec", 180))
-        use_icon = bool(cfg.get("use_game_icon_fallback", True))
 
         _enqueue_log("=" * 50)
         _enqueue_log(f"[測試] 強制重啟遊戲開始（裝置 {dev}）")
         _enqueue_log("=" * 50)
 
-        if ":" in dev:
-            try:
-                subprocess.run(["adb", "connect", dev], capture_output=True, text=True, timeout=15)
-            except Exception:
-                pass
-
-        connect_device(dev)
-        ok = force_restart_game_emulator(
-            get_game_package(),
-            get_game_activity(),
-            stop_wait=float(cfg.get("force_stop_wait_sec", 5)),
-            launch_wait=float(cfg.get("launch_wait_sec", 15)),
-            kill_retries=int(cfg.get("force_stop_retries", 3)),
-            game_icon="game_icon.png" if use_icon else None,
-            prefer_launch_via_icon=bool(cfg.get("prefer_launch_via_icon", True)),
-        )
-        if not ok:
+        if not _launch_game_and_wait_camp(dev, cfg, after_emulator_reboot=False):
             _enqueue_log("[測試] ❌ 強制重啟流程失敗")
             return
-
-        _enqueue_log(f"[測試] 等待營地主畫面 enter.png（最長 {ready_timeout}s）...")
-        ready = wait_for_image(
-            "enter.png",
-            timeout=ready_timeout,
-            interval=1.0,
-            threshold=0.72,
-            multiscale=True,
-        )
-        if ready:
-            _enqueue_log("[測試] ✅ 成功：已偵測到地下城入口 enter.png")
-        else:
-            _enqueue_log("[測試] ⚠️ 遊戲已重啟，但未匹配 enter.png（請檢查模板或調高載入等待）")
 
         _enqueue_log("[測試] 正在重新啟動戰鬥腳本...")
         ok_script, msg_script = _start_battle_script_after_recovery(dev)
@@ -822,30 +840,44 @@ def _force_restart_test_worker(device_id: str | None = None):
 
 
 def _restart_emulator_test_worker(device_id: str | None = None, emulator_key: str | None = None):
-    """背景執行：重啟整台模擬器並等待 ADB。"""
+    """背景執行：重啟模擬器 → 點 game icon → 等待營地 → 啟動戰鬥腳本。"""
     global _force_restart_running
     try:
         from emulator_control import find_mumu_manager_path, restart_emulator
+        from settings import get_auto_recovery
 
         dev = _resolve_test_device_id(device_id)
         key = str(emulator_key or "1").strip() or "1"
+        cfg = get_auto_recovery()
 
         _enqueue_log("=" * 50)
-        _enqueue_log(f"[測試] 重啟模擬器開始（裝置 {dev}，emulator key={key}）")
+        _enqueue_log(f"[測試] 完整恢復：重啟模擬器→點 icon→戰鬥腳本（{dev}）")
         mgr = find_mumu_manager_path()
         if mgr:
             _enqueue_log(f"[測試] 使用 MuMuManager: {mgr}")
         else:
             _enqueue_log("[測試] 未找到 MuMuManager，將改用 adb reboot")
 
-        ok = restart_emulator(dev, key)
-        if ok:
-            _enqueue_log("[測試] ✅ 模擬器重啟完成，ADB 已就緒")
-        else:
+        if not restart_emulator(dev, key):
             _enqueue_log("[測試] ❌ 模擬器重啟失敗")
+            return
+        _enqueue_log("[測試] ✅ 模擬器重啟完成，開始點擊遊戲 icon...")
+
+        if not _launch_game_and_wait_camp(dev, cfg, after_emulator_reboot=True):
+            _enqueue_log("[測試] ❌ 點 icon 啟動遊戲或等待營地失敗")
+            return
+
+        _enqueue_log("[測試] 正在重新啟動戰鬥腳本...")
+        ok_script, msg_script = _start_battle_script_after_recovery(dev)
+        if ok_script:
+            _enqueue_log(f"[測試] ✅ 戰鬥腳本已啟動：{msg_script}")
+        else:
+            _enqueue_log(f"[測試] ⚠️ 未能啟動戰鬥腳本：{msg_script}")
+
+        _enqueue_log("[測試] 完整恢復流程結束")
         _enqueue_log("=" * 50)
     except Exception as exc:
-        _enqueue_log(f"[測試] ❌ 重啟模擬器異常: {exc}")
+        _enqueue_log(f"[測試] ❌ 重啟模擬器流程異常: {exc}")
     finally:
         with _force_restart_lock:
             _force_restart_running = False
@@ -873,7 +905,7 @@ def api_test_restart_emulator():
     ).start()
     return jsonify({
         "ok": True,
-        "message": "已開始重啟模擬器，請在 Log 查看進度（約 1～2 分鐘）",
+        "message": "已開始：重啟模擬器→點 icon→啟動戰鬥腳本，請在 Log 查看（約 3～5 分鐘）",
     })
 
 

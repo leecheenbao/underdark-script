@@ -1082,6 +1082,7 @@ def _force_restart_kwargs(cfg: dict, use_icon: bool) -> dict:
         "launch_wait": float(cfg.get("launch_wait_sec", 15)),
         "kill_retries": int(cfg.get("force_stop_retries", 3)),
         "game_icon": "game_icon.png" if use_icon else None,
+        "game_icon_wait": 30.0,
         "prefer_launch_via_icon": bool(cfg.get("prefer_launch_via_icon", True)),
     }
 
@@ -1118,13 +1119,25 @@ def _try_restart_emulator(dev_id: str, tag: str, emulator_key: str | None = None
         return False
 
 
-def _restart_game_after_emulator(dev_id: str, tag: str, cfg: dict, use_icon: bool) -> bool:
-    """強制關閉並冷啟動遊戲（不含整機重啟）。"""
+def _restart_game_after_emulator(
+    dev_id: str,
+    tag: str,
+    cfg: dict,
+    use_icon: bool,
+    *,
+    after_emulator_reboot: bool = False,
+) -> bool:
+    """冷啟動遊戲；after_emulator_reboot=True 時略過 force-stop，直接點桌面 icon。"""
     connect_device(dev_id)
+    kw = _force_restart_kwargs(cfg, use_icon)
+    if after_emulator_reboot:
+        kw["skip_force_kill"] = True
+        kw["desktop_wait"] = float(cfg.get("desktop_wait_after_reboot_sec", 10))
+        kw["game_icon_wait"] = max(float(kw.get("game_icon_wait", 30)), 45.0)
     return force_restart_game_emulator(
         get_game_package(),
         get_game_activity(),
-        **_force_restart_kwargs(cfg, use_icon),
+        **kw,
     )
 
 
@@ -1147,10 +1160,11 @@ def _recover_device_after_failures(dev_id: str, tag: str) -> bool:
     send_telegram(f"{tag}連續失敗，開始恢復：重啟模擬器→重開遊戲→繼續腳本")
 
     # ── 步驟 1：重啟整台模擬器 ──
+    emu_rebooted = False
     if restart_emu_first:
         flow_log("恢復", "1-模擬器", "重啟整台模擬器", status="...")
-        emu_ok = _try_restart_emulator(dev_id, tag, emu_key)
-        if emu_ok:
+        emu_rebooted = _try_restart_emulator(dev_id, tag, emu_key)
+        if emu_rebooted:
             flow_log("恢復", "1-模擬器", "模擬器已重啟", status="OK")
         else:
             flow_log("恢復", "1-模擬器", "模擬器重啟失敗，改試僅重開遊戲", status="FAIL")
@@ -1158,15 +1172,18 @@ def _recover_device_after_failures(dev_id: str, tag: str) -> bool:
 
     connect_device(dev_id)
 
-    # ── 步驟 2：冷啟動遊戲 ──
+    # ── 步驟 2：冷啟動遊戲（模擬器重啟後：等桌面 → 點 game_icon）──
     restarted = False
+    after_reboot = bool(emu_rebooted and restart_emu_first)
     if restart_mode == "sl_ui":
         flow_log("恢復", "2-遊戲", "SL UI 離開後重開", status="...")
         restarted = _recover_via_sl_ui(dev_id, tag)
     elif restart_mode in ("emulator", "emulator_then_sl"):
-        flow_log("恢復", "2-遊戲", "冷啟動遊戲", status="...")
+        flow_log("恢復", "2-遊戲", "點擊遊戲 icon 啟動" if after_reboot else "冷啟動遊戲", status="...")
         try:
-            restarted = _restart_game_after_emulator(dev_id, tag, cfg, use_icon)
+            restarted = _restart_game_after_emulator(
+                dev_id, tag, cfg, use_icon, after_emulator_reboot=after_reboot,
+            )
         except Exception as exc:
             log(f"{tag}[恢復] 冷啟動遊戲異常: {exc}")
             restarted = False
@@ -1175,7 +1192,9 @@ def _recover_device_after_failures(dev_id: str, tag: str) -> bool:
             if _try_restart_emulator(dev_id, tag, emu_key):
                 connect_device(dev_id)
                 try:
-                    restarted = _restart_game_after_emulator(dev_id, tag, cfg, use_icon)
+                    restarted = _restart_game_after_emulator(
+                        dev_id, tag, cfg, use_icon, after_emulator_reboot=True,
+                    )
                 except Exception as exc:
                     log(f"{tag}[恢復] 模擬器重啟後開遊戲失敗: {exc}")
         if not restarted and restart_mode == "emulator_then_sl":

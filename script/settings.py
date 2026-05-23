@@ -138,6 +138,7 @@ def get_auto_recovery() -> dict:
         "restart_script_after_test": True,
         "restart_emulator_on_recovery": True,
         "restart_emulator_after_game_restart_fail": True,
+        "desktop_wait_after_reboot_sec": 10,
     }
     cfg = _load().get("auto_recovery") or {}
     return {**defaults, **cfg}

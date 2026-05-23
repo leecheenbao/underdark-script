@@ -1017,38 +1017,18 @@ def _cold_start_game(package_name: str, activity_name: str | None = None) -> boo
     return False
 
 
-def force_restart_game_emulator(
+def _launch_game_from_desktop(
     package_name: str,
-    activity_name: str | None = None,
+    activity_name: str | None,
     *,
-    stop_wait: float = 3.0,
-    launch_wait: float = 12.0,
-    kill_retries: int = 3,
-    game_icon: str | None = None,
-    game_icon_wait: float = 30.0,
-    prefer_launch_via_icon: bool = True,
+    game_icon: str | None,
+    game_icon_wait: float,
+    prefer_launch_via_icon: bool,
 ) -> bool:
-    """
-    透過模擬器 adb 真正關閉並冷啟動遊戲。
-    流程：force-stop 確認結束 → HOME 到桌面 → 點 game_icon 或 am start -S。
-    不使用 monkey（易恢復舊畫面而非重新啟動）。
-    """
-    if not package_name:
-        log("[模擬器] 未設定遊戲套件名，無法強制重啟")
-        return False
-
-    if not _force_kill_game_package(
-        package_name,
-        stop_wait=stop_wait,
-        kill_retries=kill_retries,
-    ):
-        return False
-
+    """從模擬器桌面點 game_icon 或 adb 冷啟動遊戲。"""
     launched = False
-
-    # 優先從模擬器桌面點圖示（與手動重開一致）
     if prefer_launch_via_icon and game_icon:
-        log(f"[模擬器] 等待桌面遊戲圖示 {game_icon} 並點擊冷啟動...")
+        log(f"[模擬器] 等待桌面遊戲圖示 {game_icon} 並點擊啟動...")
         if wait_and_click(
             game_icon,
             timeout=float(game_icon_wait),
@@ -1066,6 +1046,51 @@ def force_restart_game_emulator(
 
     if not launched:
         launched = _cold_start_game(package_name, activity_name)
+    return launched
+
+
+def force_restart_game_emulator(
+    package_name: str,
+    activity_name: str | None = None,
+    *,
+    stop_wait: float = 3.0,
+    launch_wait: float = 12.0,
+    kill_retries: int = 3,
+    game_icon: str | None = None,
+    game_icon_wait: float = 30.0,
+    prefer_launch_via_icon: bool = True,
+    skip_force_kill: bool = False,
+    desktop_wait: float = 10.0,
+) -> bool:
+    """
+    透過模擬器 adb 真正關閉並冷啟動遊戲。
+    skip_force_kill=True：模擬器整機重啟後使用，略過 force-stop，直接等桌面並點 icon。
+    """
+    if not package_name:
+        log("[模擬器] 未設定遊戲套件名，無法強制重啟")
+        return False
+
+    if skip_force_kill:
+        log("[模擬器] 模擬器剛重啟，等待桌面後點擊遊戲圖示...")
+        flow_log("恢復", "2-遊戲", f"等桌面 {desktop_wait:.0f}s", status="...")
+        time.sleep(float(desktop_wait))
+        for _ in range(2):
+            _adb_shell(["input", "keyevent", "3"])
+            time.sleep(0.4)
+    elif not _force_kill_game_package(
+        package_name,
+        stop_wait=stop_wait,
+        kill_retries=kill_retries,
+    ):
+        return False
+
+    launched = _launch_game_from_desktop(
+        package_name,
+        activity_name,
+        game_icon=game_icon,
+        game_icon_wait=game_icon_wait,
+        prefer_launch_via_icon=prefer_launch_via_icon,
+    )
 
     if not launched:
         flow_log("恢復", "模擬器", "冷啟動失敗", status="FAIL")
@@ -1073,7 +1098,7 @@ def force_restart_game_emulator(
 
     time.sleep(float(launch_wait))
     flow_log("恢復", "模擬器", "遊戲已冷啟動", status="OK")
-    log("[模擬器] 強制重啟完成，等待遊戲載入至營地")
+    log("[模擬器] 遊戲啟動完成，等待載入至營地")
     return True
 
 
