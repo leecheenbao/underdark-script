@@ -18,8 +18,10 @@ import numpy as np
 
 from utils import (
     log,
+    flow_log,
     set_telegram_log_forward,
     connect_device,
+    get_device_id,
     take_screenshot,
     load_and_match,
     click_by_image,
@@ -56,11 +58,15 @@ IMG = {
     'pet_full': "pet_full.png",     # 寵物道具已滿提示
     'enter_backpack': "enter_backpack.png",  # 進入背包按鈕
     'pet_bag': "pet_bag.png",       # 背包內寵物分頁
-    'composite': "composite.png",   # 合成按鈕
+    'compose': "compose_btn.png",       # 合成（進入合成介面）
+    'composite': "composite.png",       # 批量合成（點完合成後再按）
     'composite_confirm': "composite_confirm.png",  # 合成確認
     'left': "left.png",             # 合成品質左切換
-    'legendary_quality': "legendary_quality.png",  # 傳說品質樣式
-    'home': "home.png",             # 回主頁按鈕
+    'legendary_quality': "legendary_quality.png",  # 僅「傳說」紅字（勿含左右箭頭，否則普通畫面會誤判）
+    'common_quality': "common_quality.png",        # 「普通」等未達標品質（用於排除誤判）
+    'home': "home.png",             # 回主頁（營地）按鈕
+    'close': "close.png",           # 關閉彈窗／合成介面
+    'compose_fail': "compose_fail.png",  # 「未達到合成條件。」提示
 }
 
 # 廣告倍數按鈕：簡繁文案不同，模板需分開；同螢幕只會出現其中一種
@@ -104,8 +110,12 @@ CONFIRM_SEARCH_MIN_Y_RATIO = 0.35
 PET_FULL_THRESHOLD = 0.80
 PET_FLOW_THRESHOLD = 0.78
 PET_COMPOSITE_MAX_ROUNDS = 12
-PET_QUALITY_THRESHOLD = 0.76
+PET_QUALITY_THRESHOLD = 0.70       # 傳說紅字模板（僅文字）
+PET_COMMON_QUALITY_THRESHOLD = 0.78  # 普通字樣（僅輔助 log；勿用於否定傳說）
 PET_QUALITY_MAX_SHIFT = 8
+PET_BATCH_DIALOG_WAIT = 0.55     # 點批量合成後等待彈窗
+PET_HOME_RETURN_ATTEMPTS = 4     # 合成結束後回營地重試次數
+PET_COMPOSE_FAIL_THRESHOLD = 0.72  # 未達合成條件提示
 
 # 跨輪持久旗標：某輪偵測到滿包後設為 True，下輪開始前執行合成後清除
 # （不依賴 pet_full.png 在新一輪仍在螢幕上，避免時序問題）
@@ -544,17 +554,216 @@ def solve_captcha_if_needed(max_retry=3, fight_no=None):
     return False
 
 
-def _click_if_exists(img_key, threshold=0.8, delay=0.35, name="", multiscale=True):
+def _press_escape(count: int = 2) -> None:
+    """送 ESC 關閉合成彈窗等疊層。"""
+    dev = get_device_id()
+    if not dev:
+        return
+    for _ in range(count):
+        subprocess.run(
+            ["adb", "-s", dev, "shell", "input", "keyevent", "111"],
+            capture_output=True,
+        )
+        time.sleep(0.14)
+
+
+def _is_on_camp_main() -> bool:
+    """是否已在營地主畫面（地下城入口可見）。"""
+    found, _, _, _ = load_and_match(IMG['enter'], threshold=0.72, multiscale=True)
+    return bool(found)
+
+
+def _close_compose_overlays(step: str) -> None:
+    """關閉可能仍開著的合成／批量彈窗，避免擋住底部營地按鈕。"""
+    time.sleep(0.35)
+    _click_if_exists('close', threshold=PET_FLOW_THRESHOLD, delay=0.3, name="關閉", step=f"{step}-關閉")
+    _press_escape(1)
+    time.sleep(0.2)
+
+
+def _return_to_home_after_compose(step: str = "5-回主頁") -> bool:
+    """
+    合成結束後回到營地主畫面，確認地下城入口可見後才視為成功。
+    """
+    flow_log("寵物", step, "合成結束，準備回營地主畫面")
+    _close_compose_overlays(step)
+
+    if _is_on_camp_main():
+        flow_log("寵物", step, "已在營地主畫面", status="OK")
+        return True
+
+    for attempt in range(1, PET_HOME_RETURN_ATTEMPTS + 1):
+        flow_log("寵物", step, f"第 {attempt}/{PET_HOME_RETURN_ATTEMPTS} 次點擊 {IMG['home']}")
+        clicked = wait_and_click(
+            IMG['home'],
+            timeout=6,
+            interval=0.4,
+            threshold=PET_FLOW_THRESHOLD,
+            delay=0.85,
+            name="回營地",
+            multiscale=True,
+        )
+        if not clicked:
+            clicked = click_by_image(
+                IMG['home'],
+                threshold=PET_FLOW_THRESHOLD,
+                delay=0.85,
+                name="回營地",
+                multiscale=True,
+                show_log=True,
+            )
+        time.sleep(0.5)
+        if _is_on_camp_main():
+            flow_log("寵物", step, f"第 {attempt} 次已回營地（地下城入口可見）", status="OK")
+            return True
+        _close_compose_overlays(f"{step}-重試{attempt}")
+
+    flow_log("寵物", step, "無法確認已回營地，戰鬥可能無法繼續", status="FAIL")
+    send_telegram("寵物合成後回營地失敗，請手動點營地")
+    return False
+
+
+def _click_if_exists(img_key, threshold=0.8, delay=0.35, name="", multiscale=True, step: str = ""):
     """畫面存在才點擊；避免流程中斷。"""
+    label = name or img_key
+    st = step or label
     if not image_exists(IMG[img_key], threshold=threshold):
+        flow_log("寵物", st, f"畫面無 {IMG[img_key]}，略過", status="SKIP")
         return False
-    return click_by_image(
+    ok = click_by_image(
         IMG[img_key],
         threshold=threshold,
         delay=delay,
-        name=name or img_key,
+        name=label,
         multiscale=multiscale,
     )
+    flow_log("寵物", st, f"已點擊 {label}（{IMG[img_key]}）", status="OK" if ok else "FAIL")
+    return ok
+
+
+def _is_compose_condition_failed() -> bool:
+    """畫面是否出現「未達到合成條件。」提示。"""
+    found, _, _, _ = load_and_match(
+        IMG['compose_fail'],
+        threshold=PET_COMPOSE_FAIL_THRESHOLD,
+        multiscale=True,
+    )
+    return bool(found)
+
+
+def _abort_compose_if_failed(step: str) -> bool:
+    """回傳 True 表示應中止合成並回營地。"""
+    if _is_compose_condition_failed():
+        flow_log("寵物", step, "偵測到「未達到合成條件」，結束合成", status="SKIP")
+        return True
+    return False
+
+
+def _quality_match(img_key: str, threshold: float) -> tuple[bool, float]:
+    """品質模板比對，回傳 (是否達標, 相似度)。"""
+    found, _, _, sim = load_and_match(
+        IMG[img_key],
+        threshold=threshold,
+        multiscale=True,
+    )
+    return bool(found), float(sim or 0.0)
+
+
+def _is_legendary_quality(step: str = "") -> bool:
+    """
+    是否已為傳說品質：以傳說紅字模板為準。
+    common_quality 黑框在傳說畫面仍可能 sim≈0.74，不可拿來否定傳說判定。
+    """
+    leg_ok, leg_sim = _quality_match("legendary_quality", PET_QUALITY_THRESHOLD)
+    common_ok, common_sim = _quality_match("common_quality", PET_COMMON_QUALITY_THRESHOLD)
+    if step:
+        flow_log(
+            "寵物",
+            step,
+            f"品質偵測 傳說={leg_sim:.3f}({'Y' if leg_ok else 'N'}) "
+            f"普通={common_sim:.3f}({'Y' if common_ok else 'N'})"
+            + (" → 停止左切" if leg_ok else ""),
+        )
+    return leg_ok
+
+
+def _wait_batch_quality_dialog(step: str, timeout: float = 5.0) -> bool:
+    """批量合成彈窗出現（左鍵或品質文字任一可見）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for key, th in (
+            ("left", PET_FLOW_THRESHOLD),
+            ("common_quality", PET_COMMON_QUALITY_THRESHOLD),
+            ("legendary_quality", PET_QUALITY_THRESHOLD),
+        ):
+            found, sim = _quality_match(key, th)
+            if found:
+                flow_log("寵物", step, f"批量合成彈窗已出現（{IMG[key]} sim={sim:.3f}）", status="OK")
+                return True
+        time.sleep(0.25)
+    flow_log("寵物", step, "等待批量合成品質彈窗逾時", status="FAIL")
+    return False
+
+
+def _ensure_legendary_quality(step: str = "品質") -> bool:
+    """
+    若目前不是傳說品質，重複點 left.png 切換，直到符合 legendary_quality 或達上限。
+    """
+    if not _wait_batch_quality_dialog(step):
+        return False
+
+    if _is_legendary_quality(step=f"{step}-檢查"):
+        flow_log("寵物", step, "已是傳說品質，無需左切", status="OK")
+        return True
+
+    flow_log("寵物", step, f"非傳說品質，開始點 {IMG['left']} 切換（最多 {PET_QUALITY_MAX_SHIFT} 次）")
+    for n in range(1, PET_QUALITY_MAX_SHIFT + 1):
+        if _is_legendary_quality(step=f"{step}-第{n}前"):
+            flow_log("寵物", step, f"第 {n} 次檢查前已為傳說品質", status="OK")
+            return True
+
+        flow_log("寵物", step, f"第 {n}/{PET_QUALITY_MAX_SHIFT} 次：點 {IMG['left']}")
+        clicked = wait_and_click(
+            IMG['left'],
+            timeout=3,
+            interval=0.3,
+            threshold=PET_FLOW_THRESHOLD,
+            delay=0.35,
+            name="品質左切",
+            multiscale=True,
+            heartbeat_sec=1.0,
+        )
+        if not clicked:
+            clicked = click_by_image(
+                IMG['left'],
+                threshold=PET_FLOW_THRESHOLD,
+                delay=0.35,
+                name="品質左切",
+                multiscale=True,
+                show_log=True,
+            )
+        if not clicked:
+            _, left_sim = _quality_match("left", PET_FLOW_THRESHOLD)
+            flow_log(
+                "寵物",
+                step,
+                f"第 {n} 次找不到 {IMG['left']}（最高 sim={left_sim:.3f}），停止左切",
+                status="FAIL",
+            )
+            return False
+
+        time.sleep(0.3)
+        if _is_legendary_quality(step=f"{step}-第{n}後"):
+            flow_log("寵物", step, f"第 {n} 次左切後已為傳說品質", status="OK")
+            return True
+
+    flow_log(
+        "寵物",
+        step,
+        f"已左切 {PET_QUALITY_MAX_SHIFT} 次仍非傳說品質（請檢查 {IMG['legendary_quality']} / {IMG['left']}）",
+        status="FAIL",
+    )
+    return False
 
 
 def _detect_pet_full_once(stage: str = "") -> bool:
@@ -578,19 +787,21 @@ def _run_pet_full_flow() -> bool:
     """
     執行完整的寵物滿包合成流程，執行完後清除 _pet_full_pending 旗標。
     不需要 pet_full.png 仍在螢幕上（旗標機制已跨輪保留狀態）。
-    流程：回主頁 → 進入背包 → 切寵物分頁 → 合成（循環）→ 回主頁
+    流程：回主頁 → 進入背包 → 切寵物分頁 → 合成→批量合成（循環）→ 回主頁
     """
     global _pet_full_pending
 
-    log("[寵物] 開始滿包合成流程（home → 背包 → 寵物分頁 → 合成 → home）")
+    flow_log("寵物", "流程", "開始滿包合成（home→背包→寵物分頁→合成→批量合成→確認→home）")
     send_telegram("偵測到寵物道具已滿，開始自動合成")
 
     # Step 1：先回主頁確保畫面正確
-    _click_if_exists('home', threshold=PET_FLOW_THRESHOLD, delay=0.8, name="回主頁")
+    flow_log("寵物", "1-回主頁", "嘗試點擊 home")
+    _click_if_exists('home', threshold=PET_FLOW_THRESHOLD, delay=0.8, name="回主頁", step="1-回主頁")
 
     # Step 2：若此時 pet_full 提示仍在，先點提示本體；否則直接找進入背包按鈕
+    flow_log("寵物", "2-進背包", "檢查滿包提示並進入背包")
     if image_exists(IMG['pet_full'], threshold=PET_FULL_THRESHOLD):
-        _click_if_exists('pet_full', threshold=PET_FULL_THRESHOLD, delay=0.5, name="寵物已滿提示")
+        _click_if_exists('pet_full', threshold=PET_FULL_THRESHOLD, delay=0.5, name="寵物已滿提示", step="2-滿包提示")
 
     opened = wait_and_click(
         IMG['enter_backpack'],
@@ -602,12 +813,14 @@ def _run_pet_full_flow() -> bool:
         multiscale=True,
     )
     if not opened:
-        log("[寵物] 未找到進入背包按鈕，略過本次合成，清除旗標")
+        flow_log("寵物", "2-進背包", f"未找到 {IMG['enter_backpack']}", status="FAIL")
         _pet_full_pending = False
         return False
+    flow_log("寵物", "2-進背包", "已進入背包", status="OK")
 
     # Step 3：切到寵物分頁（等待出現再點，避免背包尚未完全載入）
-    wait_and_click(
+    flow_log("寵物", "3-寵物分頁", f"等待 {IMG['pet_bag']}")
+    pet_tab = wait_and_click(
         IMG['pet_bag'],
         timeout=6,
         interval=0.4,
@@ -616,36 +829,70 @@ def _run_pet_full_flow() -> bool:
         name="寵物分頁",
         multiscale=True,
     )
+    flow_log("寵物", "3-寵物分頁", "已切換寵物分頁" if pet_tab else "未找到寵物分頁", status="OK" if pet_tab else "FAIL")
 
-    # Step 4：合成循環
+    # Step 4：合成循環（合成 → 批量合成 → 調品質 → 確認）
+    flow_log("寵物", "4-合成循環", f"最多 {PET_COMPOSITE_MAX_ROUNDS} 輪")
     merged_count = 0
+    compose_fail_seen = False
     for i in range(PET_COMPOSITE_MAX_ROUNDS):
-        # 等待合成按鈕出現（頁面載入需時）
-        found_composite = wait_and_click(
-            IMG['composite'],
+        round_no = i + 1
+        if _abort_compose_if_failed(f"4-{round_no}-前"):
+            compose_fail_seen = True
+            break
+
+        flow_log("寵物", f"4-{round_no}", f"第 {round_no} 輪：等待 {IMG['compose']}")
+        found_compose = wait_and_click(
+            IMG['compose'],
             timeout=4,
             interval=0.4,
             threshold=PET_FLOW_THRESHOLD,
             delay=0.5,
-            name=f"合成按鈕#{i + 1}",
+            name=f"合成#{i + 1}",
             multiscale=True,
         )
-        if not found_composite:
-            log(f"[寵物] 合成按鈕未出現，結束合成循環（已合成 {merged_count} 次）")
+        if not found_compose:
+            if _abort_compose_if_failed(f"4-{round_no}"):
+                compose_fail_seen = True
+            else:
+                flow_log("寵物", f"4-{round_no}", f"合成未出現，結束（已完成 {merged_count} 次）", status="SKIP")
+            break
+        flow_log("寵物", f"4-{round_no}a", "已點合成", status="OK")
+        if _abort_compose_if_failed(f"4-{round_no}a後"):
+            compose_fail_seen = True
             break
 
-        # 切換至傳說品質
-        for _ in range(PET_QUALITY_MAX_SHIFT):
-            if image_exists(IMG['legendary_quality'], threshold=PET_QUALITY_THRESHOLD):
-                break
-            if not _click_if_exists('left', threshold=PET_FLOW_THRESHOLD, delay=0.25, name="調整品質"):
-                break
-        else:
-            # 迴圈正常結束仍未找到傳說品質：警告但繼續
-            if not image_exists(IMG['legendary_quality'], threshold=PET_QUALITY_THRESHOLD):
-                log("[寵物] 未偵測到傳說品質樣式，仍繼續合成確認")
+        flow_log("寵物", f"4-{round_no}b", f"等待 {IMG['composite']} 批量合成")
+        found_batch = wait_and_click(
+            IMG['composite'],
+            timeout=5,
+            interval=0.4,
+            threshold=PET_FLOW_THRESHOLD,
+            delay=0.5,
+            name=f"批量合成#{i + 1}",
+            multiscale=True,
+        )
+        if not found_batch:
+            if _abort_compose_if_failed(f"4-{round_no}b"):
+                compose_fail_seen = True
+            else:
+                flow_log("寵物", f"4-{round_no}b", f"批量合成未出現，結束（已完成 {merged_count} 次）", status="FAIL")
+            break
+        flow_log("寵物", f"4-{round_no}b", "已點批量合成", status="OK")
+        time.sleep(PET_BATCH_DIALOG_WAIT)
+        if _abort_compose_if_failed(f"4-{round_no}b後"):
+            compose_fail_seen = True
+            break
+
+        if not _ensure_legendary_quality(step=f"4-{round_no}c"):
+            if _abort_compose_if_failed(f"4-{round_no}c"):
+                compose_fail_seen = True
+            else:
+                flow_log("寵物", f"4-{round_no}c", "無法切到傳說品質，結束本輪合成", status="FAIL")
+            break
 
         # 等待合成確認按鈕（有淡入動畫）
+        flow_log("寵物", f"4-{round_no}d", f"等待 {IMG['composite_confirm']}")
         confirmed = wait_and_click(
             IMG['composite_confirm'],
             timeout=5,
@@ -656,33 +903,39 @@ def _run_pet_full_flow() -> bool:
             multiscale=True,
         )
         if not confirmed:
-            log(f"[寵物] 合成確認未出現，結束合成循環（已合成 {merged_count} 次）")
+            if _abort_compose_if_failed(f"4-{round_no}d"):
+                compose_fail_seen = True
+            else:
+                flow_log("寵物", f"4-{round_no}d", f"合成確認未出現，結束（已完成 {merged_count} 次）", status="FAIL")
+            break
+
+        time.sleep(0.4)  # 等待合成結果／提示出現
+        if _abort_compose_if_failed(f"4-{round_no}d後"):
+            compose_fail_seen = True
             break
 
         merged_count += 1
-        log(f"[寵物] 第 {merged_count} 次合成完成")
+        flow_log("寵物", f"4-{round_no}", f"第 {merged_count} 次合成完成", status="OK")
         time.sleep(0.3)  # 等待合成動畫
 
-    # Step 5：回主頁
-    wait_and_click(
-        IMG['home'],
-        timeout=8,
-        interval=0.5,
-        threshold=PET_FLOW_THRESHOLD,
-        delay=0.8,
-        name="回主頁",
-        multiscale=True,
-    )
+    # Step 5：回營地主畫面（須成功才繼續戰鬥）
+    home_ok = _return_to_home_after_compose(step="5-回主頁")
 
-    if merged_count > 0:
-        msg = f"寵物合成完成（共 {merged_count} 次），繼續戰鬥"
-        log(f"[寵物] {msg}")
+    if compose_fail_seen:
+        msg = "未達到合成條件，已回營地繼續戰鬥" if home_ok else "未達到合成條件，回營地失敗"
+        flow_log("寵物", "流程", msg, status="OK" if home_ok else "FAIL")
+        send_telegram(msg)
+    elif merged_count > 0:
+        msg = f"寵物合成完成（共 {merged_count} 次），已回營地，繼續戰鬥" if home_ok else (
+            f"寵物合成完成（共 {merged_count} 次），但回營地失敗"
+        )
+        flow_log("寵物", "流程", msg, status="OK" if home_ok else "FAIL")
         send_telegram(msg)
     else:
-        log("[寵物] 進入背包但無可合成項目，直接返回")
+        flow_log("寵物", "流程", "進入背包但無可合成項目", status="SKIP")
 
     _pet_full_pending = False
-    return True
+    return home_ok
 
 
 def handle_pet_full_if_needed() -> bool:
@@ -709,10 +962,13 @@ def run_fight(fight_no=None):
     # 進入前：若上輪留下滿包旗標，先執行合成流程
     # 用旗標而非重新偵測，避免回主頁後 pet_full.png 已消失導致處理被跳過
     if ENABLE_PET_FULL_CHECK and _pet_full_pending:
-        _run_pet_full_flow()
+        flow_log("戰鬥", "0-滿包", "上輪滿包旗標，先執行合成流程")
+        if not _run_pet_full_flow():
+            flow_log("戰鬥", "0-滿包", "回營地未成功，再試一次")
+            _return_to_home_after_compose(step="0-回營地重試")
 
     # 1. 等待並點擊入口（enter.png 實際為「地下城」按鈕截圖；須與當前解析度一致）
-    log("[步驟1] 等待並點擊進入")
+    flow_log("戰鬥", "1-進入", f"等待 {IMG['enter']}")
     if not wait_and_click(
         IMG['enter'],
         timeout=120,
@@ -721,9 +977,10 @@ def run_fight(fight_no=None):
         multiscale=True,
         heartbeat_sec=5,
     ):
-        log("[錯誤] 步驟1 逾時：未匹配到 enter.png，請確認已在遊戲主介面或重新截取模板圖")
+        flow_log("戰鬥", "1-進入", "逾時未匹配 enter.png", status="FAIL")
         send_telegram("步驟1 逾時：未匹配到 enter.png，請確認已在遊戲主介面或重新截取模板圖")
         return False, False
+    flow_log("戰鬥", "1-進入", "已點地下城入口", status="OK")
 
     # 進入列表後常有轉場/載入，立刻截圖可能對到過渡畫面，相似度會偏低
     # 0.2s 已足夠避開第一幀過渡畫面；若偶有誤匹配可調回 0.5
@@ -731,7 +988,7 @@ def run_fight(fight_no=None):
 
     # 2. 等待進入戰鬥按鈕出現並點擊（timeout=0 表示一直等；步驟1成功後才會很快出現）
     # enter_fight.png 建議只裁「進入」二字或固定邊框，勿包含體力數字（5/10 等會變，分數易掉到 0.5 以下）
-    log("[步驟2] 等待進入戰鬥按鈕...")
+    flow_log("戰鬥", "2-進入戰鬥", f"等待 {IMG['enter_fight']}")
     wait_and_click(
         IMG['enter_fight'],
         timeout=0,
@@ -742,18 +999,20 @@ def run_fight(fight_no=None):
         heartbeat_sec=5,
     )
 
+    flow_log("戰鬥", "2-進入戰鬥", "已點進入戰鬥", status="OK")
     _detect_pet_full_once("進入戰鬥後")
 
     # 3. 驗證碼判斷與輸入
-    log("[步驟3] 檢查驗證碼...")
+    flow_log("戰鬥", "3-驗證碼", "檢查是否需要驗證碼")
     if not solve_captcha_if_needed(max_retry=3, fight_no=fight_no):
-        log("[警告] 驗證碼處理失敗，可能需要手動介入")
+        flow_log("戰鬥", "3-驗證碼", "處理失敗", status="FAIL")
         send_telegram("😱😱😱😱😱😱驗證碼處理失敗，可能需要手動介入")
         return False, _pet_full_pending
+    flow_log("戰鬥", "3-驗證碼", "通過", status="OK")
     _detect_pet_full_once("驗證碼後")
 
     # 4. 戰鬥中，每 5 秒同時檢查簡繁兩種 ADx2 模板（任一匹配即點擊）
-    log("[步驟4] 戰鬥中，等待 ADx2...")
+    flow_log("戰鬥", "4-ADx2", "等待並點擊廣告倍數")
     wait_and_click_any(
         ADX2_TEMPLATES,
         timeout=0,
@@ -763,12 +1022,13 @@ def run_fight(fight_no=None):
         heartbeat_sec=30,
     )
 
-    # 5. 等待 ADx2 消失（簡繁兩種模板皆消失才算完成）
-    log("[步驟5] 等待 ADx2 消失...")
+    flow_log("戰鬥", "4-ADx2", "已點擊", status="OK")
+    flow_log("戰鬥", "5-ADx2消失", "等待廣告介面關閉")
     wait_for_disappear_any(ADX2_TEMPLATES, timeout=0, interval=1, name="ADx2")
+    flow_log("戰鬥", "5-ADx2消失", "已消失", status="OK")
 
     # 6. 點擊確認戰鬥（模板 confirm_fight.png，勿誤用 adx2）
-    log("[步驟6] 等待確認戰鬥：將以模板匹配並點擊...")
+    flow_log("戰鬥", "6-確認戰鬥", f"等待 {IMG['confirm_fight']}")
     wait_and_click(
         IMG['confirm_fight'],
         timeout=100,
@@ -778,8 +1038,8 @@ def run_fight(fight_no=None):
         heartbeat_sec=5,
     )
 
-    # 7. 等待確認戰鬥按鈕／介面消失
-    log("[步驟7] 等待確認戰鬥消失：直到畫面上不再匹配 confirm_fight...")
+    flow_log("戰鬥", "6-確認戰鬥", "已點擊", status="OK")
+    flow_log("戰鬥", "7-確認消失", "等待確認戰鬥消失")
     wait_for_disappear(
         IMG['confirm_fight'],
         timeout=100,
@@ -788,6 +1048,7 @@ def run_fight(fight_no=None):
         multiscale=True,
         heartbeat_sec=5,
     )
+    flow_log("戰鬥", "7-確認消失", "已消失", status="OK")
     _detect_pet_full_once("戰鬥結束")
 
     # # 8. 等待確認獎勵出現並點擊（持續心跳 log 方便排查）
@@ -801,7 +1062,7 @@ def run_fight(fight_no=None):
     #     heartbeat_sec=5,
     # )
 
-    log("[完成] 本輪戰鬥流程結束")
+    flow_log("戰鬥", "完成", f"本輪戰鬥結束（滿包旗標={_pet_full_pending}）", status="OK")
 
     return True, _pet_full_pending
 

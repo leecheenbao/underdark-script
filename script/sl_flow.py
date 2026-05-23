@@ -2,7 +2,7 @@
 SL 流程腳本
 1) 裝置1：儲存遊戲進度
 2) 裝置2：透過設定離開遊戲後，點桌面圖示重啟遊戲
-3) 裝置2：洗道具（鑽石入口 → 等 select_item → 以其為基準左滑直到 goal_pet → 點購買）
+3) 裝置2：洗道具（鑽石入口 → 等 select_item → 左滑直到 goal_pet → 點購買）
 以上 1～3 會重複執行，直到裝置2 畫面偵測到 sl_goal.png（或達 --max-loops 上限）。
 
 速度：預設已略快於舊版 0.5s 輪詢；可用 --fast 或 --interval 再調（見檔案內 SL 說明）。
@@ -17,6 +17,7 @@ import cv2
 from settings import get_device_id
 from utils import (
     log,
+    flow_log,
     send_telegram,
     set_telegram_log_forward,
     connect_device,
@@ -211,8 +212,10 @@ def restart_game_on_device_2(device_id: str) -> bool:
 
     _ensure_adb_connect(device_id)
     connect_device(device_id)
+    flow_log("SL", "2-0", f"已連線裝置2 {device_id}", status="OK")
 
     # 步驟2-1：點設定（紅點/無紅點皆可）
+    flow_log("SL", "2-1", "點設定選單")
     if not wait_and_click_any(
         SETTINGS_MENU_TEMPLATES,
         timeout=25,
@@ -224,10 +227,12 @@ def restart_game_on_device_2(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟2] 失敗：找不到設定選單")
+        flow_log("SL", "2-1", "找不到設定選單", status="FAIL")
         return False
+    flow_log("SL", "2-1", "已開設定", status="OK")
 
     # 步驟2-2：離開遊戲
+    flow_log("SL", "2-2", f"點 {IMG_LEAVE_BTN}")
     if not wait_and_click(
         IMG_LEAVE_BTN,
         timeout=20,
@@ -238,9 +243,11 @@ def restart_game_on_device_2(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟2] 失敗：找不到 leave_btn.png")
+        flow_log("SL", "2-2", "找不到 leave_btn", status="FAIL")
         return False
+    flow_log("SL", "2-2", "已點離開", status="OK")
 
+    flow_log("SL", "2-3", "離開確認 yes")
     if not wait_and_click(
         IMG_SAVE_YES,
         timeout=20,
@@ -251,12 +258,14 @@ def restart_game_on_device_2(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟2] 失敗：找不到 save_yes_btn.png")
+        flow_log("SL", "2-3", "找不到 save_yes_btn", status="FAIL")
         return False
+    flow_log("SL", "2-3", "已確認離開", status="OK")
 
     time.sleep(float(SL["pause_desktop"]))
 
-    # 步驟2-3：點桌面遊戲圖示開啟遊戲
+    # 步驟2-4：點桌面遊戲圖示開啟遊戲
+    flow_log("SL", "2-4", f"點桌面 {IMG_GAME_ICON}")
     if not wait_and_click(
         IMG_GAME_ICON,
         timeout=30,
@@ -267,11 +276,11 @@ def restart_game_on_device_2(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat_game"]),
     ):
-        log("[SL][步驟2] 失敗：找不到 game_icon.png")
+        flow_log("SL", "2-4", "找不到 game_icon", status="FAIL")
         return False
 
-    log("[SL][步驟2] 裝置2已透過圖示重新開啟遊戲")
-
+    flow_log("SL", "2-4", "已重開遊戲", status="OK")
+    flow_log("SL", "步驟2", "裝置2重啟遊戲完成", status="OK")
     return True
 
 
@@ -430,12 +439,14 @@ def tap_purchase_below_goal_pet() -> bool:
 
 
 def wash_items_on_device_2(device_id: str) -> bool:
-    """裝置2：鑽石入口 → 等 select_item → 以其為基準反覆左滑直到 goal_pet → 點購買並確認。"""
+    """裝置2：鑽石入口 → 等 select_item → 左滑直到 goal_pet → 點購買並確認。"""
     log("=" * 50)
     log(f"[SL][步驟3] 開始：裝置2洗道具（{device_id}）")
     log("=" * 50)
     connect_device(device_id)
+    flow_log("SL", "3-0", f"已連線裝置2 {device_id}", status="OK")
 
+    flow_log("SL", "3-1", f"點 {IMG_DIAMOND_ITEM}")
     if not wait_and_click(
         IMG_DIAMOND_ITEM,
         timeout=90,
@@ -446,11 +457,12 @@ def wash_items_on_device_2(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟3] 失敗：逾時或找不到 diamond_item.png")
+        flow_log("SL", "3-1", "找不到 diamond_item", status="FAIL")
         return False
+    flow_log("SL", "3-1", "已進入洗道具介面", status="OK")
 
     # 先等到橫列參考圖，並記錄錨點；滑動後 select_item 可能暫時匹配不到，仍用錨點左滑直到 goal_pet
-    log("[SL][步驟3] 等待 select_item 出現…")
+    flow_log("SL", "3-2", f"等待 {IMG_SELECT_ITEM}")
     t0 = time.time()
     hb_next = t0
     hb_sec = int(SL["heartbeat"])
@@ -467,9 +479,10 @@ def wash_items_on_device_2(device_id: str) -> bool:
             hb_next = time.time() + hb_sec
         time.sleep(float(SL["interval"]))
     else:
-        log("[SL][步驟3] 失敗：逾時未見 select_item.png")
+        flow_log("SL", "3-2", "逾時未見 select_item", status="FAIL")
         return False
 
+    flow_log("SL", "3-3", f"左滑直到 {IMG_GOAL_PET}（最多 {WASH_SWIPE_MAX} 次）")
     for i in range(WASH_SWIPE_MAX):
         # 每輪先判斷是否已出現目標，避免上一滑後 goal_pet 已出現卻仍強制找 select_item
         if goal_pet_visible(threshold=GOAL_PET_STOP_THRESHOLD):
@@ -494,12 +507,15 @@ def wash_items_on_device_2(device_id: str) -> bool:
         if not goal_pet_visible(threshold=GOAL_PET_STOP_THRESHOLD):
             log("[SL][步驟3] 失敗：滑動多次仍未偵測到 goal_pet")
             return False
-        log("[SL][步驟3] 最後一滑後偵測到 goal_pet")
+        flow_log("SL", "3-3", "最後一滑後偵測到 goal_pet", status="OK")
 
+    flow_log("SL", "3-4", "點 goal_pet 下方購買並確認")
     if not tap_purchase_below_goal_pet():
+        flow_log("SL", "3-4", "購買失敗", status="FAIL")
         return False
+    flow_log("SL", "3-4", "購買完成", status="OK")
 
-    log("[SL][步驟3] 裝置2洗道具流程完成")
+    flow_log("SL", "步驟3", "裝置2洗道具完成", status="OK")
     return True
 
 
@@ -512,6 +528,7 @@ def save_progress_on_device_1(device_id: str) -> bool:
     # 先連線裝置1
     _ensure_adb_connect(device_id)
     connect_device(device_id)
+    flow_log("SL", "1-0", f"已連線裝置1 {device_id}", status="OK")
 
     # 步驟1-1：點擊設定入口（有紅點/無紅點都可）
     has_red_dot = image_exists(IMG_SETTINGS_RED, threshold=0.76)
@@ -534,10 +551,12 @@ def save_progress_on_device_1(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟1] 失敗：找不到設定選單（settings_red/settings_no_red）")
+        flow_log("SL", "1-2", "找不到設定選單", status="FAIL")
         return False
+    flow_log("SL", "1-2", "已開設定", status="OK")
 
-    # 步驟1-2：點擊 sellections
+    # 步驟1-3：點擊 sellections
+    flow_log("SL", "1-3", f"點 {IMG_SELECTIONS}")
     if not wait_and_click(
         IMG_SELECTIONS,
         timeout=20,
@@ -548,10 +567,12 @@ def save_progress_on_device_1(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟1] 失敗：找不到 sellections.png")
+        flow_log("SL", "1-3", "找不到 sellections", status="FAIL")
         return False
+    flow_log("SL", "1-3", "已進存檔頁", status="OK")
 
-    # 步驟1-3：點擊 save_1_btn
+    # 步驟1-4：點擊 save_1_btn
+    flow_log("SL", "1-4", f"點 {IMG_SAVE_1}")
     if not wait_and_click(
         IMG_SAVE_1,
         timeout=20,
@@ -562,10 +583,12 @@ def save_progress_on_device_1(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟1] 失敗：找不到 save_1_btn.png")
+        flow_log("SL", "1-4", "找不到 save_1_btn", status="FAIL")
         return False
+    flow_log("SL", "1-4", "已點 save_1", status="OK")
 
-    # 步驟1-4：判斷 save_2_btn 字樣，若有才接續
+    # 步驟1-5：判斷 save_2_btn
+    flow_log("SL", "1-5", f"等待 {IMG_SAVE_2}")
     if not wait_for_image(
         IMG_SAVE_2,
         timeout=SAVE_PROMPT_WAIT_SEC,
@@ -573,10 +596,12 @@ def save_progress_on_device_1(device_id: str) -> bool:
         threshold=SAVE_PROMPT_THRESHOLD,
         multiscale=True,
     ):
-        log("[SL][步驟1] 失敗：未偵測到 save_2_btn.png，流程中止")
+        flow_log("SL", "1-5", "未偵測 save_2_btn", status="FAIL")
         return False
+    flow_log("SL", "1-5", "已偵測 save_2_btn", status="OK")
 
-    # 步驟1-5：點擊 save_yes_btn
+    # 步驟1-6：點擊 save_yes_btn
+    flow_log("SL", "1-6", "點 save_yes（第一段）")
     if not wait_and_click(
         IMG_SAVE_YES,
         timeout=20,
@@ -587,10 +612,12 @@ def save_progress_on_device_1(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟1] 失敗：找不到 save_yes_btn.png")
+        flow_log("SL", "1-6", "找不到 save_yes_btn", status="FAIL")
         return False
+    flow_log("SL", "1-6", "已確認第一段存檔", status="OK")
 
-    # 步驟1-6: 第二段存檔 UI（save_3）可能較晚出現；與按鈕點擊相同條件辨識
+    # 步驟1-7: 第二段存檔 UI（save_3）
+    flow_log("SL", "1-7", f"等待 {IMG_SAVE_3}")
     time.sleep(0.45)
     if not wait_for_image(
         IMG_SAVE_3,
@@ -599,11 +626,12 @@ def save_progress_on_device_1(device_id: str) -> bool:
         threshold=SAVE_PROMPT_THRESHOLD,
         multiscale=True,
     ):
-        log("[SL][步驟1] 失敗：未偵測到 save_3_btn.png，流程中止")
+        flow_log("SL", "1-7", "未偵測 save_3_btn", status="FAIL")
         return False
-    log("[SL][步驟1] 已偵測 save_3_btn.png，接續下一步")
+    flow_log("SL", "1-7", "已偵測 save_3_btn", status="OK")
 
-    # 步驟1-7:點擊 save_yes_btn
+    # 步驟1-8:點擊 save_yes_btn（第二段）
+    flow_log("SL", "1-8", "點 save_yes（第二段）")
     if not wait_and_click(
         IMG_SAVE_YES,
         timeout=20,
@@ -614,11 +642,14 @@ def save_progress_on_device_1(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟1] 失敗：找不到 save_yes_btn.png")
+        flow_log("SL", "1-8", "找不到 save_yes_btn", status="FAIL")
         return False
+    flow_log("SL", "1-8", "已確認第二段存檔", status="OK")
 
-    # 步驟1-8:點擊設定選單
+    # 步驟1-9: 第二輪設定（重複存檔流程）
+    flow_log("SL", "1-9", "第二輪：delay / 設定 / 存檔")
     if not dismiss_delay_item_if_present():
+        flow_log("SL", "1-9", "delay 處理失敗", status="FAIL")
         return False
 
     if not wait_and_click_any(
@@ -632,10 +663,11 @@ def save_progress_on_device_1(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟1] 失敗：找不到設定選單（settings_red/settings_no_red）")
+        flow_log("SL", "1-9", "第二輪找不到設定選單", status="FAIL")
         return False
+    flow_log("SL", "1-9a", "第二輪已開設定", status="OK")
 
-    # 步驟1-9：點擊 sellections
+    flow_log("SL", "1-9b", f"第二輪點 {IMG_SELECTIONS}")
     if not wait_and_click(
         IMG_SELECTIONS,
         timeout=20,
@@ -646,10 +678,11 @@ def save_progress_on_device_1(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟1] 失敗：找不到 sellections.png")
+        flow_log("SL", "1-9b", "第二輪找不到 sellections", status="FAIL")
         return False
+    flow_log("SL", "1-9b", "第二輪已進存檔頁", status="OK")
 
-    # 步驟1-10：點擊 save_1_btn
+    flow_log("SL", "1-9c", f"第二輪點 {IMG_SAVE_1}")
     if not wait_and_click(
         IMG_SAVE_1,
         timeout=20,
@@ -660,10 +693,11 @@ def save_progress_on_device_1(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟1] 失敗：找不到 save_1_btn.png")
+        flow_log("SL", "1-9c", "第二輪找不到 save_1_btn", status="FAIL")
         return False
+    flow_log("SL", "1-9c", "第二輪已點 save_1", status="OK")
 
-    # 步驟1-11：判斷 save_2_btn 字樣，若有才接續
+    flow_log("SL", "1-9d", f"第二輪等待 {IMG_SAVE_2}")
     if not wait_for_image(
         IMG_SAVE_2,
         timeout=SAVE_PROMPT_WAIT_SEC,
@@ -671,10 +705,11 @@ def save_progress_on_device_1(device_id: str) -> bool:
         threshold=SAVE_PROMPT_THRESHOLD,
         multiscale=True,
     ):
-        log("[SL][步驟1] 失敗：未偵測到 save_2_btn.png，流程中止")
+        flow_log("SL", "1-9d", "第二輪未偵測 save_2_btn", status="FAIL")
         return False
+    flow_log("SL", "1-9d", "第二輪已偵測 save_2_btn", status="OK")
 
-    # 步驟1-12：點擊 save_yes_btn
+    flow_log("SL", "1-9e", "第二輪點 save_yes")
     if not wait_and_click(
         IMG_SAVE_YES,
         timeout=20,
@@ -685,14 +720,16 @@ def save_progress_on_device_1(device_id: str) -> bool:
         multiscale=True,
         heartbeat_sec=int(SL["heartbeat"]),
     ):
-        log("[SL][步驟1] 失敗：找不到 save_yes_btn.png")
+        flow_log("SL", "1-9e", "第二輪找不到 save_yes_btn", status="FAIL")
         return False
+    flow_log("SL", "1-9e", "第二輪存檔確認完成", status="OK")
 
     # 儲存完成後連按兩次 ESC，關閉選單／重置畫面
     press_escape_key(device_id, count=2)
     time.sleep(float(SL["after_esc"]))
 
-    log("[SL][步驟1] 裝置1完成儲存進度")
+    flow_log("SL", "1-10", "送 ESC 關閉選單")
+    flow_log("SL", "步驟1", "裝置1存檔完成", status="OK")
     return True
 
 def main():
@@ -724,22 +761,28 @@ def main():
     max_loops = max(1, int(args.max_loops))
     for attempt in range(1, max_loops + 1):
         log("=" * 50)
-        log(f"[SL] 第 {attempt}/{max_loops} 輪：開始完整流程（步驟1→2→3）")
-        log("=" * 50)
+        flow_log("SL", "輪次", f"第 {attempt}/{max_loops} 輪開始（步驟1→2→3）")
 
         if not save_progress_on_device_1(device_1):
+            flow_log("SL", "輪次", "步驟1失敗，中止", status="FAIL")
             send_telegram(f"[SL] 步驟1失敗：裝置1儲存進度失敗（{device_1}）")
             return 1
+        flow_log("SL", "輪次", "步驟1完成", status="OK")
 
         if not restart_game_on_device_2(device_2):
+            flow_log("SL", "輪次", "步驟2失敗，中止", status="FAIL")
             send_telegram(f"[SL] 步驟2失敗：裝置2重啟遊戲失敗（{device_2}）")
             return 1
+        flow_log("SL", "輪次", "步驟2完成", status="OK")
 
         if not wash_items_on_device_2(device_2):
+            flow_log("SL", "輪次", "步驟3失敗，中止", status="FAIL")
             send_telegram(f"[SL] 步驟3失敗：裝置2洗道具失敗（{device_2}）")
             return 1
+        flow_log("SL", "輪次", "步驟3完成", status="OK")
 
         # 洗道具結束時已在裝置2；截圖檢查 SL 成功目標
+        flow_log("SL", "目標", f"檢查 {IMG_SL_GOAL}")
         connect_device(device_2)
         found_sg, _, _, sim_sg = load_and_match(
             IMG_SL_GOAL, threshold=SL_GOAL_MATCH_THRESHOLD, multiscale=True
@@ -750,8 +793,8 @@ def main():
             send_telegram(msg)
             return 0
 
-        log(f"[SL] 第 {attempt} 輪結束：尚未偵測 {IMG_SL_GOAL}，將重跑整輪…")
-        # 裝置2：關閉可能殘留的彈窗／重置畫面，再進入下一輪
+        flow_log("SL", "目標", f"第 {attempt} 輪未見 {IMG_SL_GOAL}（sim={sim_sg:.3f}），重跑", status="SKIP")
+        flow_log("SL", "重置", "裝置2 送 ESC 重置畫面")
         connect_device(device_2)
         press_escape_key(device_2, count=4)
         time.sleep(float(SL["interval"]))

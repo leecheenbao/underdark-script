@@ -204,6 +204,14 @@ def log(msg, telegram=None):
         _telegram_enqueue_line(line)
 
 
+def flow_log(prefix: str, step: str, message: str, *, status: str = "...") -> None:
+    """
+    流程排查用統一格式：[前綴][步驟] [狀態] 訊息
+    status 建議：...=進行中, OK=成功, FAIL=失敗, SKIP=略過
+    """
+    log(f"[{prefix}][{step}] [{status}] {message}")
+
+
 def send_telegram(text: str) -> bool:
     """
     透過 Telegram Bot API 發送訊息
@@ -953,6 +961,7 @@ def send_wechat(title, message=""):
 
 __all__ = [
     'log',
+    'flow_log',
     'set_telegram_log_forward',
     'connect_device',
     'get_device_id',
