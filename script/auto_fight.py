@@ -36,10 +36,13 @@ from utils import (
 
 # ========== 配置區 ==========
 # 設備 ID（從 settings.json 讀取）
-from settings import get_default_device, get_all_devices
+from settings import get_default_device, get_all_devices, get_pet_full_check
 
 DEVICE_ID = get_default_device()
 NUM = 5000
+
+# 道具欄滿包偵測開關（從 settings.json 的 features.pet_full_check 讀取）
+ENABLE_PET_FULL_CHECK: bool = get_pet_full_check()
 
 # 圖片路徑（相對於 pic 目錄）
 IMG = {
@@ -103,7 +106,10 @@ PET_FLOW_THRESHOLD = 0.78
 PET_COMPOSITE_MAX_ROUNDS = 12
 PET_QUALITY_THRESHOLD = 0.76
 PET_QUALITY_MAX_SHIFT = 8
-pet_compose_pending = False
+
+# 跨輪持久旗標：某輪偵測到滿包後設為 True，下輪開始前執行合成後清除
+# （不依賴 pet_full.png 在新一輪仍在螢幕上，避免時序問題）
+_pet_full_pending: bool = False
 
 
 # ========== 驗證碼處理區 ==========
@@ -551,102 +557,147 @@ def _click_if_exists(img_key, threshold=0.8, delay=0.35, name="", multiscale=Tru
     )
 
 
-def handle_pet_full_if_needed():
-    """若偵測到寵物道具已滿，依指定流程進背包合成並回主頁。"""
-    if not image_exists(IMG['pet_full'], threshold=PET_FULL_THRESHOLD):
+def _detect_pet_full_once(stage: str = "") -> bool:
+    """
+    截圖檢查 pet_full.png 是否出現。
+    若偵測到，設置跨輪旗標 _pet_full_pending = True，
+    實際合成流程在「下一輪開始前」透過 _run_pet_full_flow() 執行。
+    """
+    global _pet_full_pending
+    if not ENABLE_PET_FULL_CHECK:
         return False
+    hit = image_exists(IMG['pet_full'], threshold=PET_FULL_THRESHOLD)
+    if hit:
+        _pet_full_pending = True
+        tag = f"（{stage}）" if stage else ""
+        log(f"[寵物] 偵測到滿包{tag}，下輪戰鬥前執行合成")
+    return hit
 
-    log("[寵物] 偵測到寵物道具已滿，開始自動合成流程（home -> 背包 -> 寵物 -> 合成）")
+
+def _run_pet_full_flow() -> bool:
+    """
+    執行完整的寵物滿包合成流程，執行完後清除 _pet_full_pending 旗標。
+    不需要 pet_full.png 仍在螢幕上（旗標機制已跨輪保留狀態）。
+    流程：回主頁 → 進入背包 → 切寵物分頁 → 合成（循環）→ 回主頁
+    """
+    global _pet_full_pending
+
+    log("[寵物] 開始滿包合成流程（home → 背包 → 寵物分頁 → 合成 → home）")
     send_telegram("偵測到寵物道具已滿，開始自動合成")
 
-    # 先確保在主頁（你提供的流程第一步）
-    _click_if_exists('home', threshold=PET_FLOW_THRESHOLD, delay=0.5, name="回主頁")
+    # Step 1：先回主頁確保畫面正確
+    _click_if_exists('home', threshold=PET_FLOW_THRESHOLD, delay=0.8, name="回主頁")
 
-    # 優先點「進入背包」，若沒抓到則嘗試先點滿包提示本體
-    opened = click_by_image(
+    # Step 2：若此時 pet_full 提示仍在，先點提示本體；否則直接找進入背包按鈕
+    if image_exists(IMG['pet_full'], threshold=PET_FULL_THRESHOLD):
+        _click_if_exists('pet_full', threshold=PET_FULL_THRESHOLD, delay=0.5, name="寵物已滿提示")
+
+    opened = wait_and_click(
         IMG['enter_backpack'],
+        timeout=10,
+        interval=0.5,
         threshold=PET_FLOW_THRESHOLD,
-        delay=0.6,
+        delay=0.7,
         name="進入背包",
         multiscale=True,
     )
     if not opened:
-        _click_if_exists('pet_full', threshold=PET_FULL_THRESHOLD, delay=0.4, name="寵物已滿提示")
-        opened = wait_and_click(
-            IMG['enter_backpack'],
-            timeout=6,
-            interval=0.5,
-            threshold=PET_FLOW_THRESHOLD,
-            delay=0.6,
-            name="進入背包",
-            multiscale=True,
-        )
-    if not opened:
-        log("[寵物] 未找到進入背包按鈕，略過本次合成")
+        log("[寵物] 未找到進入背包按鈕，略過本次合成，清除旗標")
+        _pet_full_pending = False
         return False
 
-    # 切到寵物分頁
-    _click_if_exists('pet_bag', threshold=PET_FLOW_THRESHOLD, delay=0.45, name="寵物分頁")
+    # Step 3：切到寵物分頁（等待出現再點，避免背包尚未完全載入）
+    wait_and_click(
+        IMG['pet_bag'],
+        timeout=6,
+        interval=0.4,
+        threshold=PET_FLOW_THRESHOLD,
+        delay=0.5,
+        name="寵物分頁",
+        multiscale=True,
+    )
 
-    merged_any = False
+    # Step 4：合成循環
+    merged_count = 0
     for i in range(PET_COMPOSITE_MAX_ROUNDS):
-        if not image_exists(IMG['composite'], threshold=PET_FLOW_THRESHOLD):
-            break
-
-        if not click_by_image(
+        # 等待合成按鈕出現（頁面載入需時）
+        found_composite = wait_and_click(
             IMG['composite'],
+            timeout=4,
+            interval=0.4,
             threshold=PET_FLOW_THRESHOLD,
-            delay=0.45,
-            name=f"寵物合成#{i + 1}",
+            delay=0.5,
+            name=f"合成按鈕#{i + 1}",
             multiscale=True,
-        ):
+        )
+        if not found_composite:
+            log(f"[寵物] 合成按鈕未出現，結束合成循環（已合成 {merged_count} 次）")
             break
 
-        # 進入合成視窗後，先把品質切到「傳說」（left 用來調整品質）
-        shifted = False
+        # 切換至傳說品質
         for _ in range(PET_QUALITY_MAX_SHIFT):
             if image_exists(IMG['legendary_quality'], threshold=PET_QUALITY_THRESHOLD):
-                shifted = True
                 break
-            if not _click_if_exists('left', threshold=PET_FLOW_THRESHOLD, delay=0.22, name="調整品質"):
+            if not _click_if_exists('left', threshold=PET_FLOW_THRESHOLD, delay=0.25, name="調整品質"):
                 break
-        if not shifted and image_exists(IMG['legendary_quality'], threshold=PET_QUALITY_THRESHOLD):
-            shifted = True
-        if not shifted:
-            log("[寵物] 未偵測到傳說品質樣式，仍嘗試合成確認")
+        else:
+            # 迴圈正常結束仍未找到傳說品質：警告但繼續
+            if not image_exists(IMG['legendary_quality'], threshold=PET_QUALITY_THRESHOLD):
+                log("[寵物] 未偵測到傳說品質樣式，仍繼續合成確認")
 
-        # 合成確認按鈕可能有淡入，給一次等待窗口
-        wait_and_click(
+        # 等待合成確認按鈕（有淡入動畫）
+        confirmed = wait_and_click(
             IMG['composite_confirm'],
-            timeout=4,
+            timeout=5,
             interval=0.35,
             threshold=0.72,
-            delay=0.55,
+            delay=0.6,
             name="合成確認",
             multiscale=True,
         )
-        merged_any = True
-        time.sleep(0.25)
+        if not confirmed:
+            log(f"[寵物] 合成確認未出現，結束合成循環（已合成 {merged_count} 次）")
+            break
 
-    if merged_any:
-        log("[寵物] 自動合成完成，準備回主頁並返回戰鬥流程")
-        send_telegram("寵物合成完成，繼續戰鬥")
+        merged_count += 1
+        log(f"[寵物] 第 {merged_count} 次合成完成")
+        time.sleep(0.3)  # 等待合成動畫
+
+    # Step 5：回主頁
+    wait_and_click(
+        IMG['home'],
+        timeout=8,
+        interval=0.5,
+        threshold=PET_FLOW_THRESHOLD,
+        delay=0.8,
+        name="回主頁",
+        multiscale=True,
+    )
+
+    if merged_count > 0:
+        msg = f"寵物合成完成（共 {merged_count} 次），繼續戰鬥"
+        log(f"[寵物] {msg}")
+        send_telegram(msg)
     else:
-        log("[寵物] 已進入背包，但本次沒有可執行的合成")
+        log("[寵物] 進入背包但無可合成項目，直接返回")
 
-    # 用 home 回主頁，避免把 left 誤當返回鍵
-    _click_if_exists('home', threshold=PET_FLOW_THRESHOLD, delay=0.6, name="回主頁")
-
+    _pet_full_pending = False
     return True
 
 
-def _detect_pet_full_once(stage=""):
-    """單次檢查是否出現寵物滿包提示；用於本輪內先記錄，下輪再處理。"""
-    hit = image_exists(IMG['pet_full'], threshold=PET_FULL_THRESHOLD)
-    if hit:
-        tag = f"（{stage}）" if stage else ""
-        log(f"[寵物] 本輪偵測到滿包{tag}，將在下一次戰鬥前處理")
-    return hit
+def handle_pet_full_if_needed() -> bool:
+    """
+    相容舊版呼叫介面。
+    優先依旗標執行（不需要 pet_full.png 在螢幕），
+    旗標未設但畫面仍有提示時也能觸發。
+    """
+    global _pet_full_pending
+    if not ENABLE_PET_FULL_CHECK:
+        return False
+    if _pet_full_pending or image_exists(IMG['pet_full'], threshold=PET_FULL_THRESHOLD):
+        _pet_full_pending = True
+        return _run_pet_full_flow()
+    return False
 
 
 # ========== 主流程區 ==========
@@ -655,9 +706,10 @@ def run_fight(fight_no=None):
     fight_no: 當前場次編號，由 main() 傳入，供 Telegram 通知顯示
     """
 
-    # 進入前先處理上輪殘留的寵物滿包（偵測到才執行，否則跳過）
-    if _detect_pet_full_once("開戰前"):
-        handle_pet_full_if_needed()
+    # 進入前：若上輪留下滿包旗標，先執行合成流程
+    # 用旗標而非重新偵測，避免回主頁後 pet_full.png 已消失導致處理被跳過
+    if ENABLE_PET_FULL_CHECK and _pet_full_pending:
+        _run_pet_full_flow()
 
     # 1. 等待並點擊入口（enter.png 實際為「地下城」按鈕截圖；須與當前解析度一致）
     log("[步驟1] 等待並點擊進入")
@@ -690,15 +742,15 @@ def run_fight(fight_no=None):
         heartbeat_sec=5,
     )
 
-    pet_full_seen = _detect_pet_full_once("進入戰鬥後")
+    _detect_pet_full_once("進入戰鬥後")
 
     # 3. 驗證碼判斷與輸入
     log("[步驟3] 檢查驗證碼...")
     if not solve_captcha_if_needed(max_retry=3, fight_no=fight_no):
         log("[警告] 驗證碼處理失敗，可能需要手動介入")
         send_telegram("😱😱😱😱😱😱驗證碼處理失敗，可能需要手動介入")
-        return False, pet_full_seen
-    pet_full_seen = pet_full_seen or _detect_pet_full_once("驗證碼後")
+        return False, _pet_full_pending
+    _detect_pet_full_once("驗證碼後")
 
     # 4. 戰鬥中，每 5 秒同時檢查簡繁兩種 ADx2 模板（任一匹配即點擊）
     log("[步驟4] 戰鬥中，等待 ADx2...")
@@ -736,7 +788,7 @@ def run_fight(fight_no=None):
         multiscale=True,
         heartbeat_sec=5,
     )
-    pet_full_seen = pet_full_seen or _detect_pet_full_once("戰鬥結束")
+    _detect_pet_full_once("戰鬥結束")
 
     # # 8. 等待確認獎勵出現並點擊（持續心跳 log 方便排查）
     # log("[步驟8] 等待確認獎勵：將以 confirm_rewards.png 匹配並點擊...")
@@ -751,7 +803,7 @@ def run_fight(fight_no=None):
 
     log("[完成] 本輪戰鬥流程結束")
 
-    return True, pet_full_seen
+    return True, _pet_full_pending
 
 
 def _ensure_device_connected(dev_id: str):
@@ -882,12 +934,41 @@ def _run_multi_devices():
     return 0 if all(c == 0 for c in exit_codes) else 1
 
 
+def _run_test_pet_flow():
+    """
+    測試模式：連接預設設備後直接執行一次滿包合成流程，完成後退出。
+    用於驗證「進入背包 → 切寵物分頁 → 合成 → 回主頁」流程是否正確。
+    """
+    global _pet_full_pending
+    set_telegram_log_forward(False)
+    log("=" * 50)
+    log("[測試] 滿包合成流程測試開始")
+    log("=" * 50)
+
+    connect_device(DEVICE_ID)
+
+    # 強制設旗標，跳過截圖偵測，直接執行合成
+    _pet_full_pending = True
+    ok = _run_pet_full_flow()
+
+    log("=" * 50)
+    log(f"[測試] 流程結束，結果：{'成功' if ok else '失敗'}")
+    log("=" * 50)
+    return 0 if ok else 1
+
+
 def main():
     """主入口"""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--device-id", default="")
     parser.add_argument("--worker-name", default="")
+    parser.add_argument("--test-pet-flow", action="store_true",
+                        help="測試模式：直接執行一次滿包合成流程後退出")
     args, _ = parser.parse_known_args()
+
+    # 測試模式：直接跑合成流程
+    if args.test_pet_flow:
+        return _run_test_pet_flow()
 
     # 子程序（指定設備）走單設備流程；未指定則由主程序決定單/雙設備模式
     if args.device_id:

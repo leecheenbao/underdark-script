@@ -89,3 +89,24 @@ def get_cert_config():
 def get_telegram_config():
     """Telegram 日誌：{"enabled": bool, "bot_token": str, "chat_id": str}"""
     return _load()["telegram"]
+
+
+def get_features() -> dict:
+    """取得功能開關設定 {"pet_full_check": bool, ...}"""
+    return _load().get("features", {})
+
+
+def get_pet_full_check() -> bool:
+    """道具欄滿包偵測開關（預設 True）"""
+    return bool(get_features().get("pet_full_check", True))
+
+
+def set_pet_full_check(enabled: bool):
+    """寫入道具欄滿包偵測開關至 settings.json"""
+    global _cache
+    with open(_SETTINGS_PATH, encoding="utf-8-sig") as f:
+        cfg = json.load(f)
+    cfg.setdefault("features", {})["pet_full_check"] = bool(enabled)
+    with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    _cache = None  # 清除快取，下次讀取會重新載入

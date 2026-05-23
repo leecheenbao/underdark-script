@@ -25,5 +25,8 @@
     "enabled": true,
     "bot_token": "8679880392:AAHFMSjrsVPRtCiL1Xbi8lMR4fph_KyLY6g",
     "chat_id": "5342598543"
+  },
+  "features": {
+    "pet_full_check": true
   }
 }

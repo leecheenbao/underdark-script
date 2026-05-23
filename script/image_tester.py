@@ -101,14 +101,44 @@ def start_script(
     device_id: str | None = None,
     device_id_1: str | None = None,
     device_id_2: str | None = None,
+    extra_args: list[str] | None = None,
 ):
-    """啟動控制台專用 bat（已有程序在跑則不重複啟動）"""
+    """
+    啟動 auto_fight.py（已有程序在跑則不重複啟動）。
+    extra_args: 附加命令列參數（如 ['--test-pet-flow']），
+                有附加參數時直接用 sys.executable 執行，略過 bat 設備檢查。
+    """
     global _proc
     with _proc_lock:
         if _proc and _proc.poll() is None:
             return False, "腳本已在執行中"
 
-        # 寫入臨時參數到 settings.json（可選）
+        env = os.environ.copy()
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+
+        # ── 測試模式（有 extra_args）：直接用 python 執行，不走 bat ──
+        if extra_args:
+            cmd = [sys.executable, AUTO_FIGHT_PY] + extra_args
+            try:
+                _proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    cwd=SCRIPT_DIR,
+                    env=env,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                )
+            except Exception as e:
+                return False, str(e)
+            label = " ".join(extra_args)
+            threading.Thread(target=_read_stream, args=(_proc.stdout,), daemon=True).start()
+            _enqueue_log(f"[系統] 測試模式啟動（{label}，PID {_proc.pid}）")
+            return True, f"測試模式啟動（{label}，PID {_proc.pid}）"
+
+        # ── 正常模式：寫入設定後走 bat ──
         if num is not None or device_id is not None or device_id_1 is not None or device_id_2 is not None:
             _patch_settings(
                 num=num,
@@ -121,7 +151,6 @@ def start_script(
         if not os.path.exists(run_bat):
             return False, f"找不到啟動檔：{run_bat}"
 
-        # 一般「啟動腳本」固定只跑第一組設備；雙設備請使用 SL 流程按鈕
         cur = _read_current_devices()
         run_device = (
             str(device_id_1 or "").strip()
@@ -131,7 +160,6 @@ def start_script(
         if not run_device:
             return False, "未設定第一組設備 ID（請先到設定頁填入 ADB 設備 ID #1）"
 
-        env = os.environ.copy()
         try:
             _proc = subprocess.Popen(
                 ["cmd.exe", "/c", run_bat, "--device-id", run_device, "--worker-name", "模擬器1"],
@@ -141,7 +169,6 @@ def start_script(
                 bufsize=1,
                 cwd=SCRIPT_DIR,
                 env=env,
-                # Windows 上避免彈出黑色命令列視窗
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
         except Exception as e:
@@ -608,6 +635,16 @@ def api_script_stop():
     return jsonify({"ok": ok, "message": msg})
 
 
+@app.route("/api/script/test-pet-flow", methods=["POST"])
+def api_test_pet_flow():
+    """啟動 auto_fight.py --test-pet-flow，直接測試滿包合成流程"""
+    with _proc_lock:
+        if _proc and _proc.poll() is None:
+            return jsonify({"ok": False, "message": "腳本執行中，請先停止後再測試"}), 400
+    ok, msg = start_script(extra_args=["--test-pet-flow"])
+    return jsonify({"ok": ok, "message": msg})
+
+
 @app.route("/api/script/logs/stream")
 def api_logs_stream():
     """SSE：即時推送 log 行"""
@@ -641,19 +678,28 @@ def api_logs_clear():
 @app.route("/api/settings")
 def api_settings_get():
     devs = _read_current_devices()
+    # 從 settings.json 讀取 features 開關
+    pet_full_check = True
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+        pet_full_check = bool(cfg.get("features", {}).get("pet_full_check", True))
+    except Exception:
+        pass
     return jsonify({
-        "num":       _read_current_num(),
-        "device_id": devs.get("device_id_1", ""),  # 相容舊前端
-        "device_id_1": devs.get("device_id_1", ""),
-        "device_id_2": devs.get("device_id_2", ""),
+        "num":           _read_current_num(),
+        "device_id":     devs.get("device_id_1", ""),
+        "device_id_1":   devs.get("device_id_1", ""),
+        "device_id_2":   devs.get("device_id_2", ""),
+        "pet_full_check": pet_full_check,
     })
 
 
 @app.route("/api/settings", methods=["POST"])
 def api_settings_set():
-    body      = request.json or {}
-    num       = int(body["num"]) if "num" in body else None
-    device_id = body.get("device_id") or None
+    body        = request.json or {}
+    num         = int(body["num"]) if "num" in body else None
+    device_id   = body.get("device_id") or None
     device_id_1 = body.get("device_id_1")
     device_id_2 = body.get("device_id_2")
     _patch_settings(
@@ -662,6 +708,16 @@ def api_settings_set():
         device_id_1=device_id_1,
         device_id_2=device_id_2,
     )
+    # 寫入 features.pet_full_check
+    if "pet_full_check" in body:
+        try:
+            with open(SETTINGS_PATH, encoding="utf-8-sig") as f:
+                cfg = json.load(f)
+            cfg.setdefault("features", {})["pet_full_check"] = bool(body["pet_full_check"])
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True})
 
 
@@ -839,6 +895,13 @@ header h1{font-size:1.05rem;color:var(--accent);white-space:nowrap}
 .field-grid{display:grid;grid-template-columns:auto 1fr;gap:4px 8px;align-items:center}
 .field-grid label{font-size:.78rem;color:var(--muted);white-space:nowrap}
 .field-grid input{background:#0d1526;border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:.8rem}
+/* Toggle Switch */
+.toggle-switch{position:relative;display:inline-block;width:46px;height:24px;flex-shrink:0}
+.toggle-switch input{opacity:0;width:0;height:0}
+.toggle-slider{position:absolute;cursor:pointer;inset:0;background:#2a3f6a;border-radius:24px;transition:.25s}
+.toggle-slider:before{content:"";position:absolute;width:18px;height:18px;left:3px;bottom:3px;background:#aaa;border-radius:50%;transition:.25s}
+.toggle-switch input:checked + .toggle-slider{background:var(--green)}
+.toggle-switch input:checked + .toggle-slider:before{transform:translateX(22px);background:#fff}
 /* 分頁捲軸 */
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:transparent}
@@ -989,7 +1052,7 @@ header h1{font-size:1.05rem;color:var(--accent);white-space:nowrap}
 
 <!-- ═══ Tab: 設定 ═══ -->
 <div class="tab-content" id="tabSettings">
-  <div class="panel" style="max-width:480px">
+  <div class="panel" style="max-width:520px">
     <div class="card">
       <div class="card-title">腳本執行設定</div>
       <div class="field" style="margin-bottom:12px">
@@ -1007,12 +1070,35 @@ header h1{font-size:1.05rem;color:var(--accent);white-space:nowrap}
       <button class="btn btn-green" onclick="saveSettings()">💾 儲存設定</button>
       <span id="settingsSaved" style="font-size:.8rem;color:var(--green);margin-left:10px;display:none">✅ 已儲存</span>
     </div>
+
+    <!-- 功能開關 -->
+    <div class="card">
+      <div class="card-title">功能開關</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
+        <div>
+          <div style="font-size:.88rem;font-weight:600">道具欄滿包偵測</div>
+          <div style="font-size:.75rem;color:var(--muted);margin-top:2px">偵測到道具欄已滿時自動進入背包合成寵物</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <button class="btn btn-orange" id="btnTestPetFlow" onclick="runTestPetFlow()"
+                  style="padding:5px 12px;font-size:.78rem" title="直接執行一次合成流程以驗證設定正確">
+            🧪 測試合成流程
+          </button>
+          <label class="toggle-switch">
+            <input type="checkbox" id="togPetFull" onchange="saveFeatureToggle('pet_full_check', this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+      <div id="testPetResult" style="font-size:.78rem;margin-top:8px;display:none"></div>
+    </div>
+
     <div class="card">
       <div class="card-title">說明</div>
       <ul style="font-size:.8rem;color:var(--muted);line-height:1.9;padding-left:16px">
         <li>「執行場次」會即時修改 <code>auto_fight.py</code> 的 <code>NUM</code> 值</li>
         <li>可同時設定兩組設備 ID，腳本啟動時會自動並行執行兩台模擬器</li>
-        <li>設定儲存後，下次啟動腳本時才生效</li>
+        <li>設定與功能開關儲存後，下次啟動腳本時才生效</li>
         <li>模板圖請存為 PNG；上傳後不需重啟伺服器</li>
       </ul>
     </div>
@@ -1566,13 +1652,16 @@ async function runMatch() {
 // ════════════ 設定 ════════════
 async function loadSettings() {
   const d = await fetch('/api/settings').then(r=>r.json());
-  document.getElementById('cfgNum').value    = d.num;
+  document.getElementById('cfgNum').value     = d.num;
   document.getElementById('cfgDevice1').value = d.device_id_1 || d.device_id || '';
   document.getElementById('cfgDevice2').value = d.device_id_2 || '';
+  // 功能開關
+  const togPet = document.getElementById('togPetFull');
+  if (togPet) togPet.checked = d.pet_full_check !== false;
 }
 
 async function saveSettings() {
-  const num      = parseInt(document.getElementById('cfgNum').value);
+  const num       = parseInt(document.getElementById('cfgNum').value);
   const deviceId1 = document.getElementById('cfgDevice1').value.trim();
   const deviceId2 = document.getElementById('cfgDevice2').value.trim();
   await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1580,6 +1669,36 @@ async function saveSettings() {
   const el = document.getElementById('settingsSaved');
   el.style.display = 'inline';
   setTimeout(()=>el.style.display='none', 2000);
+}
+
+async function saveFeatureToggle(key, value) {
+  await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({[key]: value})});
+}
+
+async function runTestPetFlow() {
+  const btn = document.getElementById('btnTestPetFlow');
+  const info = document.getElementById('testPetResult');
+  btn.disabled = true;
+  btn.textContent = '⏳ 執行中...';
+  info.style.display = 'block';
+  info.style.color = 'var(--orange)';
+  info.textContent = '測試中，請觀察「腳本執行」分頁的 Log...';
+
+  const resp = await fetch('/api/script/test-pet-flow', {method:'POST'});
+  const d = await resp.json();
+
+  btn.disabled = false;
+  btn.textContent = '🧪 測試合成流程';
+  if (d.ok) {
+    info.style.color = 'var(--green)';
+    info.textContent = '✅ 已啟動測試 — 切換至「🖥 腳本執行」分頁查看即時 Log';
+    // 自動切換到腳本執行分頁
+    switchTab('tabScript');
+  } else {
+    info.style.color = '#e74c3c';
+    info.textContent = '❌ ' + d.message;
+  }
 }
 
 // 預先載入設定到 Header 的啟動按鈕用
