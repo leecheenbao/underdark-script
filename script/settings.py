@@ -153,3 +153,32 @@ def set_pet_full_check(enabled: bool):
     with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     _cache = None  # 清除快取，下次讀取會重新載入
+
+
+def set_telegram_config(
+    *,
+    enabled: bool | None = None,
+    bot_token: str | None = None,
+    chat_id: str | None = None,
+    update_token_if_empty: bool = False,
+) -> dict:
+    """
+    寫入 Telegram 設定至 settings.json。
+    bot_token 為空字串時：預設不覆寫既有 token（避免儲存時清空）；update_token_if_empty=True 則允許清空。
+    """
+    global _cache
+    with open(_SETTINGS_PATH, encoding="utf-8-sig") as f:
+        cfg = json.load(f)
+    tg = cfg.setdefault("telegram", {})
+    if enabled is not None:
+        tg["enabled"] = bool(enabled)
+    if bot_token is not None:
+        text = str(bot_token).strip()
+        if text or update_token_if_empty:
+            tg["bot_token"] = text
+    if chat_id is not None:
+        tg["chat_id"] = str(chat_id).strip()
+    with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    _cache = None
+    return dict(tg)

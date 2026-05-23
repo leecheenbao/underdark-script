@@ -967,12 +967,18 @@ def api_logs_clear():
 @app.route("/api/settings")
 def api_settings_get():
     devs = _read_current_devices()
-    # 從 settings.json 讀取 features 開關
     pet_full_check = True
+    telegram_enabled = False
+    telegram_bot_token = ""
+    telegram_chat_id = ""
     try:
         with open(SETTINGS_PATH, encoding="utf-8-sig") as f:
             cfg = json.load(f)
         pet_full_check = bool(cfg.get("features", {}).get("pet_full_check", True))
+        tg = cfg.get("telegram") or {}
+        telegram_enabled = bool(tg.get("enabled", False))
+        telegram_bot_token = str(tg.get("bot_token") or "").strip()
+        telegram_chat_id = str(tg.get("chat_id") or "").strip()
     except Exception:
         pass
     return jsonify({
@@ -981,6 +987,10 @@ def api_settings_get():
         "device_id_1":   devs.get("device_id_1", ""),
         "device_id_2":   devs.get("device_id_2", ""),
         "pet_full_check": pet_full_check,
+        "telegram_enabled": telegram_enabled,
+        "telegram_bot_token": telegram_bot_token,
+        "telegram_chat_id": telegram_chat_id,
+        "telegram_token_configured": bool(telegram_bot_token),
     })
 
 
@@ -1007,7 +1017,39 @@ def api_settings_set():
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
+
+    # 寫入 Telegram（dashboard 設定）
+    tg_keys = ("telegram_enabled", "telegram_bot_token", "telegram_chat_id")
+    if any(k in body for k in tg_keys):
+        try:
+            from settings import set_telegram_config
+
+            token_in_body = "telegram_bot_token" in body
+            set_telegram_config(
+                enabled=bool(body["telegram_enabled"]) if "telegram_enabled" in body else None,
+                bot_token=str(body.get("telegram_bot_token", "")).strip() if token_in_body else None,
+                chat_id=str(body.get("telegram_chat_id", "")).strip() if "telegram_chat_id" in body else None,
+            )
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     return jsonify({"ok": True})
+
+
+@app.route("/api/settings/test-telegram", methods=["POST"])
+def api_settings_test_telegram():
+    """發送一則測試訊息（使用目前 settings.json 的 Telegram 設定）。"""
+    try:
+        from settings import reload as reload_settings
+        from utils import send_telegram
+
+        reload_settings()
+        ok = send_telegram("Under Dark 控制台：Telegram 連線測試 ✅")
+        if ok:
+            return jsonify({"ok": True, "message": "測試訊息已發送"})
+        return jsonify({"ok": False, "message": "發送失敗，請確認已啟用且 Bot Token / Chat ID 正確"}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 500
 
 
 # ── OCR 測試 ──────────────────────────────────────────────────
@@ -1360,6 +1402,34 @@ header h1{font-size:1.05rem;color:var(--accent);white-space:nowrap}
       <span id="settingsSaved" style="font-size:.8rem;color:var(--green);margin-left:10px;display:none">✅ 已儲存</span>
     </div>
 
+    <div class="card">
+      <div class="card-title">Telegram 通知</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0 12px;border-bottom:1px solid var(--border)">
+        <div>
+          <div style="font-size:.88rem;font-weight:600">啟用 Telegram</div>
+          <div style="font-size:.75rem;color:var(--muted);margin-top:2px">腳本重要事件與 send_telegram 通知（寫入 settings.json）</div>
+        </div>
+        <label class="toggle-switch">
+          <input type="checkbox" id="togTelegram">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="field" style="margin-bottom:12px">
+        <label>Bot Token</label>
+        <input id="cfgTgToken" type="password" autocomplete="off" style="width:100%;max-width:420px"
+               placeholder="123456789:ABC...（從 @BotFather 取得）">
+        <div id="tgTokenHint" style="font-size:.72rem;color:var(--muted);margin-top:4px"></div>
+      </div>
+      <div class="field" style="margin-bottom:14px">
+        <label>Chat ID</label>
+        <input id="cfgTgChatId" type="text" style="width:100%;max-width:280px"
+               placeholder="例如 5342598543 或 -100xxxxxxxx">
+      </div>
+      <button class="btn btn-gray" type="button" id="btnTestTelegram" onclick="testTelegram()"
+              style="padding:6px 14px;font-size:.8rem">📨 測試發送</button>
+      <span id="tgTestResult" style="font-size:.78rem;margin-left:10px;display:none"></span>
+    </div>
+
     <!-- 功能開關 -->
     <div class="card">
       <div class="card-title">功能開關</div>
@@ -1410,7 +1480,7 @@ header h1{font-size:1.05rem;color:var(--accent);white-space:nowrap}
       <ul style="font-size:.8rem;color:var(--muted);line-height:1.9;padding-left:16px">
         <li>「執行場次」會即時修改 <code>auto_fight.py</code> 的 <code>NUM</code> 值</li>
         <li>可同時設定兩組設備 ID，腳本啟動時會自動並行執行兩台模擬器</li>
-        <li>設定與功能開關儲存後，下次啟動腳本時才生效</li>
+        <li>設定與功能開關儲存後寫入 <code>settings.json</code>；Telegram 儲存後立即生效</li>
         <li>模板圖請存為 PNG；上傳後不需重啟伺服器</li>
       </ul>
     </div>
@@ -1967,20 +2037,57 @@ async function loadSettings() {
   document.getElementById('cfgNum').value     = d.num;
   document.getElementById('cfgDevice1').value = d.device_id_1 || d.device_id || '';
   document.getElementById('cfgDevice2').value = d.device_id_2 || '';
-  // 功能開關
   const togPet = document.getElementById('togPetFull');
   if (togPet) togPet.checked = d.pet_full_check !== false;
+  const togTg = document.getElementById('togTelegram');
+  if (togTg) togTg.checked = !!d.telegram_enabled;
+  const tokEl = document.getElementById('cfgTgToken');
+  const chatEl = document.getElementById('cfgTgChatId');
+  if (tokEl) tokEl.value = d.telegram_bot_token || '';
+  if (chatEl) chatEl.value = d.telegram_chat_id || '';
+  const hint = document.getElementById('tgTokenHint');
+  if (hint) {
+    hint.textContent = d.telegram_token_configured
+      ? '已設定 Token；留空儲存時不會清除既有 Token'
+      : '尚未設定 Token';
+  }
 }
 
 async function saveSettings() {
   const num       = parseInt(document.getElementById('cfgNum').value);
   const deviceId1 = document.getElementById('cfgDevice1').value.trim();
   const deviceId2 = document.getElementById('cfgDevice2').value.trim();
+  const tgEnabled = document.getElementById('togTelegram')?.checked ?? false;
+  const tgToken   = document.getElementById('cfgTgToken')?.value ?? '';
+  const tgChatId  = document.getElementById('cfgTgChatId')?.value.trim() ?? '';
   await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({num, device_id_1: deviceId1, device_id_2: deviceId2})});
+    body: JSON.stringify({
+      num,
+      device_id_1: deviceId1,
+      device_id_2: deviceId2,
+      telegram_enabled: tgEnabled,
+      telegram_bot_token: tgToken,
+      telegram_chat_id: tgChatId,
+    })});
   const el = document.getElementById('settingsSaved');
   el.style.display = 'inline';
   setTimeout(()=>el.style.display='none', 2000);
+  loadSettings();
+}
+
+async function testTelegram() {
+  const btn = document.getElementById('btnTestTelegram');
+  const res = document.getElementById('tgTestResult');
+  btn.disabled = true;
+  res.style.display = 'inline';
+  res.style.color = 'var(--orange)';
+  res.textContent = '發送中...';
+  await saveSettings();
+  const resp = await fetch('/api/settings/test-telegram', {method:'POST'});
+  const d = await resp.json();
+  btn.disabled = false;
+  res.style.color = d.ok ? 'var(--green)' : '#e74c3c';
+  res.textContent = d.ok ? ('✅ ' + (d.message || '已發送')) : ('❌ ' + (d.message || '失敗'));
 }
 
 async function saveFeatureToggle(key, value) {
