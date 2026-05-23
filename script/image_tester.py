@@ -159,6 +159,10 @@ def _resolve_sl_launch_command():
             return ["cmd.exe", "/c", bat], f"BAT: {os.path.basename(bat)}"
     for py_file in SL_PY_CANDIDATES:
         if os.path.exists(py_file):
+            base = os.path.basename(py_file).lower()
+            if base == "sl_flow.py":
+                cmd = [sys.executable, "-u", py_file, "--fast"]
+                return cmd, f"PY: {os.path.basename(py_file)} (--fast)"
             return [sys.executable, "-u", py_file], f"PY: {os.path.basename(py_file)}"
     return None, ""
 

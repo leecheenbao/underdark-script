@@ -600,14 +600,16 @@ def image_exists(img, threshold=0.8):
     return found
 
 
-def wait_for_image(img, timeout=10, interval=0.5, threshold=0.8):
+def wait_for_image(img, timeout=10, interval=0.5, threshold=0.8, multiscale=False):
     """
     等待圖片出現
     傳回: True=找到, False=逾時
+    multiscale: 與 load_and_match 一致，建議與同畫面其他按鈕的 wait_and_click 一致
     """
     start = time.time()
     while time.time() - start < timeout:
-        if image_exists(img, threshold):
+        found, _, _, _ = load_and_match(img, threshold, multiscale=multiscale)
+        if found:
             return True
         time.sleep(interval)
     return False
