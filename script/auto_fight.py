@@ -75,7 +75,16 @@ IMG = {
     'home': "home.png",             # 回主頁（營地）按鈕
     'close': "close.png",           # 關閉彈窗／合成介面
     'compose_fail': "compose_fail.png",  # 「未達到合成條件。」提示
+    'rank_reg_fail': "rank_reg_fail.png",  # 「排名註冊失敗。再試一次嗎？」
 }
+
+# 排名註冊失敗偵測（匹配 pic/rank_reg_fail.png）
+RANK_REG_FAIL_THRESHOLD = 0.72
+
+
+class RankRegisterFailError(Exception):
+    """畫面出現排名註冊失敗，需立即重啟模擬器。"""
+    pass
 
 # 廣告倍數按鈕：簡繁文案不同，模板需分開；同螢幕只會出現其中一種
 ADX2_TEMPLATES = [IMG['adx2'], IMG['adx2_tw']]
@@ -962,6 +971,96 @@ def handle_pet_full_if_needed() -> bool:
 
 
 # ========== 主流程區 ==========
+
+def _detect_rank_register_fail(step: str = "") -> bool:
+    """是否出現「排名註冊失敗」對話框文字。"""
+    found, sim, _, _ = load_and_match(
+        IMG["rank_reg_fail"],
+        threshold=RANK_REG_FAIL_THRESHOLD,
+        multiscale=True,
+    )
+    if found:
+        flow_log("戰鬥", step or "排名失敗", f"偵測到排名註冊失敗 (sim={sim:.2f})", status="FAIL")
+        return True
+    return False
+
+
+def _raise_if_rank_register_fail(step: str):
+    if _detect_rank_register_fail(step):
+        send_telegram("排名註冊失敗，立即重啟模擬器")
+        raise RankRegisterFailError()
+
+
+def _wait_click_safe(step: str, fn, *args, **kwargs):
+    """分段 wait_and_click / wait_and_click_any，穿插排名失敗檢查。"""
+    _raise_if_rank_register_fail(step)
+    timeout = kwargs.get("timeout", 10)
+    if timeout == 0:
+        while True:
+            _raise_if_rank_register_fail(step)
+            chunk_kw = dict(kwargs)
+            chunk_kw["timeout"] = 4
+            chunk_kw["heartbeat_sec"] = 0
+            if fn(*args, **chunk_kw):
+                return True
+    if timeout > 0:
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            _raise_if_rank_register_fail(step)
+            chunk_kw = dict(kwargs)
+            remain = max(1.0, deadline - time.time())
+            chunk_kw["timeout"] = min(4.0, remain)
+            chunk_kw["heartbeat_sec"] = 0
+            if fn(*args, **chunk_kw):
+                return True
+        return False
+    return fn(*args, **kwargs)
+
+
+def _wait_disappear_safe(step: str, fn, *args, **kwargs):
+    """分段 wait_for_disappear / wait_for_disappear_any，穿插排名失敗檢查。"""
+    _raise_if_rank_register_fail(step)
+    timeout = kwargs.get("timeout", 10)
+    if timeout == 0:
+        while True:
+            _raise_if_rank_register_fail(step)
+            chunk_kw = dict(kwargs)
+            chunk_kw["timeout"] = 4
+            chunk_kw["heartbeat_sec"] = 0
+            if fn(*args, **chunk_kw):
+                return True
+    if timeout > 0:
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            _raise_if_rank_register_fail(step)
+            chunk_kw = dict(kwargs)
+            remain = max(1.0, deadline - time.time())
+            chunk_kw["timeout"] = min(4.0, remain)
+            chunk_kw["heartbeat_sec"] = 0
+            if fn(*args, **chunk_kw):
+                return True
+        return False
+    return fn(*args, **kwargs)
+
+
+def _handle_rank_register_fail_recovery(
+    dev_id: str,
+    tag: str,
+    worker_name: str,
+    resume_fight: int,
+    restart_after_recovery: bool,
+) -> bool:
+    """排名註冊失敗 → 重啟模擬器 → 重開遊戲 → 繼續戰鬥腳本。"""
+    global _pet_full_pending
+    _pet_full_pending = False
+    log(f"{tag}[排名失敗] 立即重啟模擬器（從第 {resume_fight} 場繼續）")
+    if not _recover_device_after_failures(dev_id, tag):
+        return False
+    if restart_after_recovery:
+        _restart_battle_script_process(dev_id, worker_name, resume_fight=resume_fight)
+    return True
+
+
 def run_fight(fight_no=None):
     """執行一次完整的戰鬥流程。回傳 (success, pet_full_seen_in_round)。
     fight_no: 當前場次編號，由 main() 傳入，供 Telegram 通知顯示
@@ -969,6 +1068,8 @@ def run_fight(fight_no=None):
 
     # 進入前：若上輪留下滿包旗標，先執行合成流程
     # 用旗標而非重新偵測，避免回主頁後 pet_full.png 已消失導致處理被跳過
+    _raise_if_rank_register_fail("0-進入前")
+
     if ENABLE_PET_FULL_CHECK and _pet_full_pending:
         flow_log("戰鬥", "0-滿包", "上輪滿包旗標，先執行合成流程")
         if not _run_pet_full_flow():
@@ -977,7 +1078,9 @@ def run_fight(fight_no=None):
 
     # 1. 等待並點擊入口（enter.png 實際為「地下城」按鈕截圖；須與當前解析度一致）
     flow_log("戰鬥", "1-進入", f"等待 {IMG['enter']}")
-    if not wait_and_click(
+    if not _wait_click_safe(
+        "1-進入",
+        wait_and_click,
         IMG['enter'],
         timeout=120,
         interval=1,
@@ -997,7 +1100,9 @@ def run_fight(fight_no=None):
     # 2. 等待進入戰鬥按鈕出現並點擊（timeout=0 表示一直等；步驟1成功後才會很快出現）
     # enter_fight.png 建議只裁「進入」二字或固定邊框，勿包含體力數字（5/10 等會變，分數易掉到 0.5 以下）
     flow_log("戰鬥", "2-進入戰鬥", f"等待 {IMG['enter_fight']}")
-    wait_and_click(
+    _wait_click_safe(
+        "2-進入戰鬥",
+        wait_and_click,
         IMG['enter_fight'],
         timeout=0,
         interval=0.5,
@@ -1021,7 +1126,9 @@ def run_fight(fight_no=None):
 
     # 4. 戰鬥中，每 5 秒同時檢查簡繁兩種 ADx2 模板（任一匹配即點擊）
     flow_log("戰鬥", "4-ADx2", "等待並點擊廣告倍數")
-    wait_and_click_any(
+    _wait_click_safe(
+        "4-ADx2",
+        wait_and_click_any,
         ADX2_TEMPLATES,
         timeout=0,
         interval=5,
@@ -1032,12 +1139,21 @@ def run_fight(fight_no=None):
 
     flow_log("戰鬥", "4-ADx2", "已點擊", status="OK")
     flow_log("戰鬥", "5-ADx2消失", "等待廣告介面關閉")
-    wait_for_disappear_any(ADX2_TEMPLATES, timeout=0, interval=1, name="ADx2")
+    _wait_disappear_safe(
+        "5-ADx2消失",
+        wait_for_disappear_any,
+        ADX2_TEMPLATES,
+        timeout=0,
+        interval=1,
+        name="ADx2",
+    )
     flow_log("戰鬥", "5-ADx2消失", "已消失", status="OK")
 
     # 6. 點擊確認戰鬥（模板 confirm_fight.png，勿誤用 adx2）
     flow_log("戰鬥", "6-確認戰鬥", f"等待 {IMG['confirm_fight']}")
-    wait_and_click(
+    _wait_click_safe(
+        "6-確認戰鬥",
+        wait_and_click,
         IMG['confirm_fight'],
         timeout=100,
         interval=0.5,
@@ -1048,7 +1164,9 @@ def run_fight(fight_no=None):
 
     flow_log("戰鬥", "6-確認戰鬥", "已點擊", status="OK")
     flow_log("戰鬥", "7-確認消失", "等待確認戰鬥消失")
-    wait_for_disappear(
+    _wait_disappear_safe(
+        "7-確認消失",
+        wait_for_disappear,
         IMG['confirm_fight'],
         timeout=100,
         interval=1,
@@ -1069,6 +1187,8 @@ def run_fight(fight_no=None):
     #     multiscale=True,
     #     heartbeat_sec=5,
     # )
+
+    _raise_if_rank_register_fail("完成前")
 
     flow_log("戰鬥", "完成", f"本輪戰鬥結束（滿包旗標={_pet_full_pending}）", status="OK")
 
@@ -1297,6 +1417,7 @@ def _run_single_device(dev_id: str, worker_name: str = "", resume_fight: int = 1
         log("=" * 50)
         log(f"{tag}第 {i+1}/{NUM} 次戰鬥開始（成功 {success_count} / 失敗 {fail_count}）")
         log("=" * 50)
+        _raise_if_rank_register_fail("戰鬥前")
         try:
             result = run_fight(fight_no=i + 1)
             # run_fight 可能回傳 (bool, bool) 或單純 bool（相容兩種版本）
@@ -1308,6 +1429,16 @@ def _run_single_device(dev_id: str, worker_name: str = "", resume_fight: int = 1
                 fail_count += 1
                 consecutive_fail += 1
                 log(f"{tag}[警告] 第 {i+1} 次戰鬥回傳失敗（連續 {consecutive_fail}/{max_consecutive}），繼續下一輪")
+        except RankRegisterFailError:
+            fail_count += 1
+            log(f"{tag}[排名失敗] 第 {i+1} 次戰鬥中偵測到排名註冊失敗")
+            if _handle_rank_register_fail_recovery(
+                dev_id, tag, worker_name, i + 1, restart_after_recovery,
+            ):
+                consecutive_fail = 0
+                continue
+            send_telegram(f"{tag}排名註冊失敗且恢復失敗，腳本停止")
+            return 1
         except Exception as exc:
             fail_count += 1
             consecutive_fail += 1
