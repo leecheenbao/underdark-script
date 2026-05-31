@@ -54,6 +54,8 @@
     "restart_script_after_test": true,
     "restart_emulator_on_recovery": true,
     "restart_emulator_after_game_restart_fail": true,
-    "desktop_wait_after_reboot_sec": 10
+    "desktop_wait_after_reboot_sec": 10,
+    "flow_stall_timeout_sec": 600,
+    "flow_stall_recovery_enabled": true
   }
 }

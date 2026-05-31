@@ -139,6 +139,9 @@ def get_auto_recovery() -> dict:
         "restart_emulator_on_recovery": True,
         "restart_emulator_after_game_restart_fail": True,
         "desktop_wait_after_reboot_sec": 10,
+        # 同一流程步驟停留過久（如一直「等待進入戰鬥」）則重啟模擬器
+        "flow_stall_timeout_sec": 600,
+        "flow_stall_recovery_enabled": True,
     }
     cfg = _load().get("auto_recovery") or {}
     return {**defaults, **cfg}

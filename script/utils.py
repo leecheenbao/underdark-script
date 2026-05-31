@@ -204,11 +204,63 @@ def log(msg, telegram=None):
         _telegram_enqueue_line(line)
 
 
+class FlowStallError(Exception):
+    """同一流程步驟停留過久，需重啟模擬器。"""
+
+    def __init__(self, prefix: str, step: str, elapsed_sec: float):
+        self.prefix = prefix
+        self.step = step
+        self.elapsed_sec = elapsed_sec
+        super().__init__(f"{prefix}/{step} 已停留 {elapsed_sec:.0f}s")
+
+
+# 流程卡住看門狗：同一 (prefix, step) 超過設定秒數未切換則拋 FlowStallError
+_flow_key: tuple[str, str] | None = None
+_flow_key_since: float = time.time()
+
+
+def reset_flow_watchdog(prefix: str = "腳本", step: str = "啟動") -> None:
+    """重置流程計時（新場次／恢復後呼叫）。"""
+    global _flow_key, _flow_key_since
+    _flow_key = (prefix, step)
+    _flow_key_since = time.time()
+
+
+def note_flow(prefix: str, step: str) -> None:
+    """記錄流程步驟；僅在步驟變更時重置計時。"""
+    global _flow_key, _flow_key_since
+    key = (prefix, step)
+    if key != _flow_key:
+        _flow_key = key
+        _flow_key_since = time.time()
+
+
+def check_flow_stall() -> None:
+    """若目前流程步驟停留過久，拋出 FlowStallError。"""
+    if _flow_key is None:
+        return
+    try:
+        from settings import get_auto_recovery
+        cfg = get_auto_recovery()
+    except Exception:
+        return
+    if not bool(cfg.get("flow_stall_recovery_enabled", True)):
+        return
+    timeout = int(cfg.get("flow_stall_timeout_sec", 600))
+    if timeout <= 0:
+        return
+    elapsed = time.time() - _flow_key_since
+    if elapsed >= timeout:
+        prefix, step = _flow_key
+        raise FlowStallError(prefix, step, elapsed)
+
+
 def flow_log(prefix: str, step: str, message: str, *, status: str = "...") -> None:
     """
     流程排查用統一格式：[前綴][步驟] [狀態] 訊息
     status 建議：...=進行中, OK=成功, FAIL=失敗, SKIP=略過
     """
+    note_flow(prefix, step)
     log(f"[{prefix}][{step}] [{status}] {message}")
 
 
@@ -658,6 +710,7 @@ def wait_and_click(
     next_heartbeat = start + heartbeat_sec if heartbeat_sec > 0 else None
 
     while True:
+        check_flow_stall()
         # 每輪只截圖匹配一次：心跳與是否點擊共用同一結果，避免「心跳顯示夠高、下一幀點擊卻失敗」
         found, tap_x, tap_y, sim = load_and_match(img, threshold, multiscale=multiscale)
 
@@ -711,6 +764,7 @@ def wait_and_click_any(
     next_heartbeat = start + heartbeat_sec if heartbeat_sec > 0 else None
 
     while True:
+        check_flow_stall()
         screen_path = take_screenshot()
         best_sim = -1.0
         best_label = labels[0] if labels else ""
@@ -771,6 +825,7 @@ def wait_for_disappear(
     next_heartbeat = start + heartbeat_sec if heartbeat_sec > 0 else None
 
     while True:
+        check_flow_stall()
         screen_path = take_screenshot()
         found, _, _, sim = load_and_match(
             img, threshold, screen_path=screen_path, multiscale=multiscale
@@ -798,6 +853,7 @@ def wait_for_disappear_any(
     threshold=0.9,
     name="",
     multiscale=False,
+    heartbeat_sec=0,
 ):
     """任一模板仍能被匹配則視為尚未消失（與 wait_and_click_any 成對使用）"""
     if not img_list:
@@ -805,24 +861,32 @@ def wait_for_disappear_any(
         return True
     log(f"等待 {name} 消失...")
     start = time.time()
+    next_heartbeat = start + heartbeat_sec if heartbeat_sec > 0 else None
 
     while True:
+        check_flow_stall()
         screen_path = take_screenshot()
         any_hit = False
+        last_sim = 0.0
         for img in img_list:
-            found, _, _, _ = load_and_match(
+            found, _, _, sim = load_and_match(
                 img, threshold, screen_path=screen_path, multiscale=multiscale
             )
             if found:
                 any_hit = True
+                last_sim = max(last_sim, sim)
                 break
 
         if not any_hit:
             log(f"{name} 已消失")
             return True
 
+        if heartbeat_sec > 0 and next_heartbeat is not None and time.time() >= next_heartbeat:
+            log(f"仍在等待 {name} 消失...（畫面上仍可匹配，相似度 {last_sim:.4f}）")
+            next_heartbeat = time.time() + heartbeat_sec
+
         if timeout > 0 and time.time() - start >= timeout:
-            log(f"等待 {name} 消失逾時")
+            log(f"等待 {name} 消失逾時（最後相似度: {last_sim:.4f}）")
             return False
 
         time.sleep(interval)

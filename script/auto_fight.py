@@ -19,6 +19,9 @@ import numpy as np
 from utils import (
     log,
     flow_log,
+    FlowStallError,
+    reset_flow_watchdog,
+    check_flow_stall,
     set_telegram_log_forward,
     connect_device,
     get_device_id,
@@ -992,12 +995,14 @@ def _raise_if_rank_register_fail(step: str):
 
 
 def _wait_click_safe(step: str, fn, *args, **kwargs):
-    """分段 wait_and_click / wait_and_click_any，穿插排名失敗檢查。"""
+    """分段 wait_and_click / wait_and_click_any，穿插排名失敗與流程卡住檢查。"""
     _raise_if_rank_register_fail(step)
+    check_flow_stall()
     timeout = kwargs.get("timeout", 10)
     if timeout == 0:
         while True:
             _raise_if_rank_register_fail(step)
+            check_flow_stall()
             chunk_kw = dict(kwargs)
             chunk_kw["timeout"] = 4
             chunk_kw["heartbeat_sec"] = 0
@@ -1007,6 +1012,7 @@ def _wait_click_safe(step: str, fn, *args, **kwargs):
         deadline = time.time() + float(timeout)
         while time.time() < deadline:
             _raise_if_rank_register_fail(step)
+            check_flow_stall()
             chunk_kw = dict(kwargs)
             remain = max(1.0, deadline - time.time())
             chunk_kw["timeout"] = min(4.0, remain)
@@ -1018,12 +1024,14 @@ def _wait_click_safe(step: str, fn, *args, **kwargs):
 
 
 def _wait_disappear_safe(step: str, fn, *args, **kwargs):
-    """分段 wait_for_disappear / wait_for_disappear_any，穿插排名失敗檢查。"""
+    """分段 wait_for_disappear / wait_for_disappear_any，穿插排名失敗與流程卡住檢查。"""
     _raise_if_rank_register_fail(step)
+    check_flow_stall()
     timeout = kwargs.get("timeout", 10)
     if timeout == 0:
         while True:
             _raise_if_rank_register_fail(step)
+            check_flow_stall()
             chunk_kw = dict(kwargs)
             chunk_kw["timeout"] = 4
             chunk_kw["heartbeat_sec"] = 0
@@ -1033,6 +1041,7 @@ def _wait_disappear_safe(step: str, fn, *args, **kwargs):
         deadline = time.time() + float(timeout)
         while time.time() < deadline:
             _raise_if_rank_register_fail(step)
+            check_flow_stall()
             chunk_kw = dict(kwargs)
             remain = max(1.0, deadline - time.time())
             chunk_kw["timeout"] = min(4.0, remain)
@@ -1041,6 +1050,32 @@ def _wait_disappear_safe(step: str, fn, *args, **kwargs):
                 return True
         return False
     return fn(*args, **kwargs)
+
+
+def _handle_flow_stall_recovery(
+    dev_id: str,
+    tag: str,
+    worker_name: str,
+    resume_fight: int,
+    restart_after_recovery: bool,
+    stall: FlowStallError,
+) -> bool:
+    """流程卡住過久 → 重啟模擬器 → 重開遊戲 → 繼續戰鬥腳本。"""
+    global _pet_full_pending
+    _pet_full_pending = False
+    timeout = int(get_auto_recovery().get("flow_stall_timeout_sec", 600))
+    log(
+        f"{tag}[流程卡住] {stall.prefix}/{stall.step} 已停留 {stall.elapsed_sec:.0f}s"
+        f"（上限 {timeout}s），重啟模擬器（從第 {resume_fight} 場繼續）"
+    )
+    send_telegram(
+        f"{tag}流程卡住 {stall.prefix}/{stall.step} 超過 {timeout}s，重啟模擬器"
+    )
+    if not _recover_device_after_failures(dev_id, tag):
+        return False
+    if restart_after_recovery:
+        _restart_battle_script_process(dev_id, worker_name, resume_fight=resume_fight)
+    return True
 
 
 def _handle_rank_register_fail_recovery(
@@ -1407,6 +1442,7 @@ def _run_single_device(dev_id: str, worker_name: str = "", resume_fight: int = 1
 
     _ensure_device_connected(dev_id)
     connect_device(dev_id)
+    reset_flow_watchdog("腳本", "啟動")
 
     success_count    = 0
     fail_count       = 0
@@ -1417,6 +1453,7 @@ def _run_single_device(dev_id: str, worker_name: str = "", resume_fight: int = 1
         log("=" * 50)
         log(f"{tag}第 {i+1}/{NUM} 次戰鬥開始（成功 {success_count} / 失敗 {fail_count}）")
         log("=" * 50)
+        reset_flow_watchdog("戰鬥", f"第{i + 1}場")
         _raise_if_rank_register_fail("戰鬥前")
         try:
             result = run_fight(fight_no=i + 1)
@@ -1438,6 +1475,16 @@ def _run_single_device(dev_id: str, worker_name: str = "", resume_fight: int = 1
                 consecutive_fail = 0
                 continue
             send_telegram(f"{tag}排名註冊失敗且恢復失敗，腳本停止")
+            return 1
+        except FlowStallError as stall:
+            fail_count += 1
+            log(f"{tag}[流程卡住] 第 {i+1} 次戰鬥：{stall}")
+            if _handle_flow_stall_recovery(
+                dev_id, tag, worker_name, i + 1, restart_after_recovery, stall,
+            ):
+                consecutive_fail = 0
+                continue
+            send_telegram(f"{tag}流程卡住且恢復失敗，腳本停止")
             return 1
         except Exception as exc:
             fail_count += 1
